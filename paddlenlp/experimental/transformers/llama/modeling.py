@@ -150,13 +150,15 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
         ln_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ln_scale".format(i)) for i in range(self.num_layers)]
         qkv_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.qkv_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.qkv_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
         out_proj_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.out_proj_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.out_proj_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
@@ -165,19 +167,22 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
         ]
         gate_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.gate_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.gate_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
         up_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.up_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.up_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
         ffn2_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.ffn2_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.ffn2_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
@@ -257,19 +262,12 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
             # merge batch and seq_len dimension.
             inputs_embeds = inputs_embeds.reshape([batch * seq_len, hidden_dim])
 
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
         with dy2st_nocheck_guard_context():
             hidden_states = self.transformer_block(
                 input_ids=input_ids,
@@ -280,11 +278,7 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
             )
         hidden_states = self.norm(hidden_states)
 
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, None, all_hidden_states, None] if v is not None)
+        return hidden_states
 
     @paddle.no_grad()
     # avx
@@ -339,7 +333,8 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
                 )  # reshape(3, self.num_attention_heself.hidden_sizeads // self.config.tensor_parallel_degree, head_size, )
             if "llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx) in state_dict.keys():
                 concated_ffn1_weight = np.concatenate(
-                    split_fn(state_dict["llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx)]), axis=-1
+                    split_fn(state_dict["llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx)]),
+                    axis=-1,
                 )
             else:
                 unfused_state_dict["mlp.gate_proj.weight"] = state_dict[
@@ -347,7 +342,11 @@ class LlamaAvxInferenceModel(LlamaPretrainedModel):
                 ]
                 unfused_state_dict["mlp.up_proj.weight"] = state_dict["llama.layers.{}.mlp.up_proj.weight".format(idx)]
                 concated_ffn1_weight = np.concatenate(
-                    [unfused_state_dict["mlp.gate_proj.weight"], unfused_state_dict["mlp.up_proj.weight"]], axis=-1
+                    [
+                        unfused_state_dict["mlp.gate_proj.weight"],
+                        unfused_state_dict["mlp.up_proj.weight"],
+                    ],
+                    axis=-1,
                 )
             gate_up_list = split_fn(concated_ffn1_weight)
             gate_weight_tensor = paddle.to_tensor(gate_up_list[0])
@@ -401,7 +400,6 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         self.epsilon = config.rms_norm_eps
         self.max_position_embeddings = config.max_position_embeddings
         self.quant_type = config.get("quant_type", "")
-        self.return_full_hidden_states = config.get("return_full_hidden_states", False)
 
         self.rope_theta = config.rope_theta
         self.use_neox = True
@@ -487,13 +485,15 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         ln_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ln_scale".format(i)) for i in range(self.num_layers)]
         qkv_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.qkv_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.qkv_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
         out_proj_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.out_proj_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.out_proj_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
@@ -503,26 +503,30 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         if "fp8" in self.quant_type:
             ffn1_0_weight_attrs = [
                 paddle.ParamAttr(
-                    name="fusellama.{}.ffn1_0_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                    name="fusellama.{}.ffn1_0_weight".format(i),
+                    initializer=paddle.nn.initializer.Constant(value=0),
                 )
                 for i in range(self.num_layers)
             ]
             ffn1_1_weight_attrs = [
                 paddle.ParamAttr(
-                    name="fusellama.{}.ffn1_1_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                    name="fusellama.{}.ffn1_1_weight".format(i),
+                    initializer=paddle.nn.initializer.Constant(value=0),
                 )
                 for i in range(self.num_layers)
             ]
         else:
             ffn1_weight_attrs = [
                 paddle.ParamAttr(
-                    name="fusellama.{}.ffn1_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                    name="fusellama.{}.ffn1_weight".format(i),
+                    initializer=paddle.nn.initializer.Constant(value=0),
                 )
                 for i in range(self.num_layers)
             ]
         ffn2_weight_attrs = [
             paddle.ParamAttr(
-                name="fusellama.{}.ffn2_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+                name="fusellama.{}.ffn2_weight".format(i),
+                initializer=paddle.nn.initializer.Constant(value=0),
             )
             for i in range(self.num_layers)
         ]
@@ -617,7 +621,6 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         speculate_config = SpeculateConfig(
             speculate_method=config.get("speculate_method", None),
             speculate_max_draft_token_num=config.get("speculate_max_draft_token_num", 5),
-            return_full_hidden_states=config.get("return_full_hidden_states", False),
         )
 
         hpu_config = HpuConfig(
@@ -797,7 +800,12 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         from paddlenlp_ops import fused_get_rotary_embedding
 
         new_rope = fused_get_rotary_embedding(
-            input_ids, position_ids, self.head_dim_shape_tensor, position_offset, self.rope_theta, self.use_neox
+            input_ids,
+            position_ids,
+            self.head_dim_shape_tensor,
+            position_offset,
+            self.rope_theta,
+            self.use_neox,
         )
 
         with dy2st_nocheck_guard_context():
@@ -813,7 +821,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 seq_lens=seq_lens,
                 rotary_embs=new_rope,
                 rotary_emb_dims=1,
-                time_step=paddle.increment(paddle.shape(attention_mask)[-1], -1) if is_decoder else None,
+                time_step=(paddle.increment(paddle.shape(attention_mask)[-1], -1) if is_decoder else None),
             )
         hidden_states = self.norm(hidden_states)
 
@@ -844,14 +852,18 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 weight_scale_json_path = resolve_file_path(self.quant_model_path, "weight_scales.json")
                 if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
                     act_scale_json_path = resolve_file_path(
-                        self.quant_model_path, f"act_scales_{self.config.tensor_parallel_rank}.json"
+                        self.quant_model_path,
+                        f"act_scales_{self.config.tensor_parallel_rank}.json",
                     )
                     weight_scale_json_path = resolve_file_path(
-                        self.quant_model_path, f"weight_scales_{self.config.tensor_parallel_rank}.json"
+                        self.quant_model_path,
+                        f"weight_scales_{self.config.tensor_parallel_rank}.json",
                     )
 
                 act_scales = ActScalesLoader(
-                    act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+                    act_scale_json_path,
+                    act_scale_map_dict,
+                    num_of_layers=self.config.num_hidden_layers,
                 )
 
                 weight_scales = PerTensorWeightScalesLoader(
@@ -882,13 +894,17 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                     weight_scale_json_path = resolve_file_path(self.quant_model_path, "weight_scales.json")
                     if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
                         act_scale_json_path = resolve_file_path(
-                            self.quant_model_path, f"act_scales_{self.config.tensor_parallel_rank}.json"
+                            self.quant_model_path,
+                            f"act_scales_{self.config.tensor_parallel_rank}.json",
                         )
                         weight_scale_json_path = resolve_file_path(
-                            self.quant_model_path, f"weight_scales_{self.config.tensor_parallel_rank}.json"
+                            self.quant_model_path,
+                            f"weight_scales_{self.config.tensor_parallel_rank}.json",
                         )
                     act_scale_loader = ActScalesLoader(
-                        act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+                        act_scale_json_path,
+                        act_scale_map_dict,
+                        num_of_layers=self.config.num_hidden_layers,
                     )
                     weight_scales_loader = WeightScalesLoader(
                         weight_scale_json_path,
@@ -969,7 +985,8 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 cache_scale_json_path = resolve_file_path(self.quant_model_path, "cachekv_scales.json")
                 if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
                     cache_scale_json_path = resolve_file_path(
-                        self.quant_model_path, f"cachekv_scales_{self.config.tensor_parallel_rank}.json"
+                        self.quant_model_path,
+                        f"cachekv_scales_{self.config.tensor_parallel_rank}.json",
                     )
                 cache_scales_loader = CacheScaleLoader(
                     cache_scale_json_path,
@@ -1108,7 +1125,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
             if self.use_weight_only:
                 qkv_weight_tensor = paddle.transpose(qkv_weight_tensor, perm=[1, 0])
                 qkv_quanted_weight_tensor, qkv_weight_scale_tensor = weight_quantize(
-                    qkv_weight_tensor.cpu(), algo=self.quant_algo, group_size=self.weightonly_group_size
+                    qkv_weight_tensor.cpu(),
+                    algo=self.quant_algo,
+                    group_size=self.weightonly_group_size,
                 )
                 self.transformer_block.qkv_weights[idx].set_value(qkv_quanted_weight_tensor.cuda())
                 self.transformer_block.qkv_weights_scale[idx].set_value(qkv_weight_scale_tensor.cuda())
@@ -1126,7 +1145,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
             ).cast(paddle.get_default_dtype())
             if self.use_weight_only:
                 linear_quanted_weight_tensor, linear_weight_scale_tensor = weight_quantize(
-                    linear_weight_tensor.cpu(), algo=self.quant_algo, group_size=self.weightonly_group_size
+                    linear_weight_tensor.cpu(),
+                    algo=self.quant_algo,
+                    group_size=self.weightonly_group_size,
                 )
                 self.transformer_block.linear_weights[idx].set_value(linear_quanted_weight_tensor.cuda())
                 self.transformer_block.linear_weights_scale[idx].set_value(linear_weight_scale_tensor.cuda())
@@ -1173,7 +1194,8 @@ class LlamaInferenceModel(LlamaPretrainedModel):
 
             if "llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx) in state_dict.keys():
                 concated_ffn1_weight = np.concatenate(
-                    split_fn(state_dict["llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx)]), axis=-1
+                    split_fn(state_dict["llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx)]),
+                    axis=-1,
                 )
             else:
                 unfused_state_dict["mlp.gate_proj.weight"] = state_dict[
@@ -1181,13 +1203,19 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 ]
                 unfused_state_dict["mlp.up_proj.weight"] = state_dict["llama.layers.{}.mlp.up_proj.weight".format(idx)]
                 concated_ffn1_weight = np.concatenate(
-                    [unfused_state_dict["mlp.gate_proj.weight"], unfused_state_dict["mlp.up_proj.weight"]], axis=-1
+                    [
+                        unfused_state_dict["mlp.gate_proj.weight"],
+                        unfused_state_dict["mlp.up_proj.weight"],
+                    ],
+                    axis=-1,
                 )
             ffn1_weight_tensor = paddle.to_tensor(concated_ffn1_weight).cast(paddle.get_default_dtype())
 
             if self.use_weight_only:
                 ffn1_quanted_weight_tensor, ffn1_weight_scale_tensor = weight_quantize(
-                    ffn1_weight_tensor.cpu(), algo=self.quant_algo, group_size=self.weightonly_group_size
+                    ffn1_weight_tensor.cpu(),
+                    algo=self.quant_algo,
+                    group_size=self.weightonly_group_size,
                 )
                 self.transformer_block.ffn1_weights[idx].set_value(ffn1_quanted_weight_tensor.cuda())
                 self.transformer_block.ffn1_weights_scale[idx].set_value(ffn1_weight_scale_tensor.cuda())
@@ -1214,7 +1242,10 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                     )
                 else:
                     self.transformer_block.ffn1_weights[idx].set_value(
-                        paddle.cast(paddle.to_tensor(concated_ffn1_weight).transpose((1, 0)), w_dtype)
+                        paddle.cast(
+                            paddle.to_tensor(concated_ffn1_weight).transpose((1, 0)),
+                            w_dtype,
+                        )
                     )
             else:
                 self.transformer_block.ffn1_weights[idx].set_value(ffn1_weight_tensor)
@@ -1224,7 +1255,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
             )
             if self.use_weight_only:
                 ffn2_quanted_weight_tensor, ffn2_weight_scale_tensor = weight_quantize(
-                    ffn2_weight_tensor.cpu(), algo=self.quant_algo, group_size=self.weightonly_group_size
+                    ffn2_weight_tensor.cpu(),
+                    algo=self.quant_algo,
+                    group_size=self.weightonly_group_size,
                 )
                 self.transformer_block.ffn2_weights[idx].set_value(ffn2_quanted_weight_tensor.cuda())
                 self.transformer_block.ffn2_weights_scale[idx].set_value(ffn2_weight_scale_tensor.cuda())
@@ -1244,7 +1277,8 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 if paddle.is_compiled_with_rocm():
                     self.transformer_block.ffn2_weights[idx].set_value(
                         paddle.cast(
-                            paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)]), w_dtype
+                            paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)]),
+                            w_dtype,
                         )
                     )
                 else:
@@ -1310,7 +1344,8 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                     if self.use_fake_parameter:
                         if "llama.layers.{}.input_layernorm.bias".format(idx) not in state_dict:
                             state_dict["llama.layers.{}.input_layernorm.bias".format(idx)] = paddle.zeros(
-                                shape=[self.hidden_size], dtype=paddle.get_default_dtype()
+                                shape=[self.hidden_size],
+                                dtype=paddle.get_default_dtype(),
                             )
                             state_dict["llama.layers.{}.post_attention_layernorm.bias".format(idx)] = paddle.zeros(
                                 [self.hidden_size], dtype=paddle.get_default_dtype()
@@ -1328,10 +1363,12 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                                 dtype=paddle.get_default_dtype(),
                             )
                             unfused_state_dict["mlp.gate_proj.bias"] = paddle.zeros(
-                                shape=[self.intermediate_size], dtype=paddle.get_default_dtype()
+                                shape=[self.intermediate_size],
+                                dtype=paddle.get_default_dtype(),
                             )
                             unfused_state_dict["mlp.up_proj.bias"] = paddle.zeros(
-                                shape=[self.intermediate_size], dtype=paddle.get_default_dtype()
+                                shape=[self.intermediate_size],
+                                dtype=paddle.get_default_dtype(),
                             )
                     else:
                         unfused_state_dict["self_attn.q_proj.bias"] = state_dict[
@@ -1369,7 +1406,11 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                     self.transformer_block.qkv_biases[idx].set_value(paddle.to_tensor(concated_qkv_biases))
 
                     concated_ffn1_bias = np.concatenate(
-                        [unfused_state_dict["mlp.gate_proj.bias"], unfused_state_dict["mlp.up_proj.bias"]], axis=-1
+                        [
+                            unfused_state_dict["mlp.gate_proj.bias"],
+                            unfused_state_dict["mlp.up_proj.bias"],
+                        ],
+                        axis=-1,
                     )
 
                     self.transformer_block.ffn1_biases[idx].set_value(paddle.to_tensor(concated_ffn1_bias))
@@ -1417,10 +1458,23 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         token_num = paddle.sum(seq_lens_this_time)
         from paddlenlp_ops import get_padding_offset_v2
 
+        cum_offsets_now = paddle.cast(cum_offsets_now, dtype="int32")
+
         ids_remove_padding, cum_offsets, padding_offset, cu_seqlens_q, cu_seqlens_k = get_padding_offset_v2(
-            input_ids, cum_offsets_now, token_num, seq_lens_this_time, draft_tokens, seq_lens_encoder
+            input_ids,
+            cum_offsets_now,
+            token_num,
+            seq_lens_this_time,
+            draft_tokens,
+            seq_lens_encoder,
         )
-        return ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k
+        return (
+            ids_remove_padding,
+            padding_offset,
+            cum_offsets,
+            cu_seqlens_q,
+            cu_seqlens_k,
+        )
 
     def forward(
         self,
@@ -1479,13 +1533,21 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
 
             # whether speculative decoding or not
             if draft_tokens is None:
-                ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
-                    input_ids, seq_lens_this_time
-                )
+                (
+                    ids_remove_padding,
+                    padding_offset,
+                    cum_offsets,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                ) = self.remove_padding(input_ids, seq_lens_this_time)
             else:
-                ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
-                    input_ids, seq_lens_this_time, draft_tokens, seq_lens_encoder
-                )
+                (
+                    ids_remove_padding,
+                    padding_offset,
+                    cum_offsets,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                ) = self.remove_padding(input_ids, seq_lens_this_time, draft_tokens, seq_lens_encoder)
 
             kwargs["cu_seqlens_q"] = cu_seqlens_q
             kwargs["cu_seqlens_k"] = cu_seqlens_k
@@ -1496,7 +1558,7 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         inputs_embeds = self.embed_tokens(ids_remove_padding)
 
         with dy2st_nocheck_guard_context():
-            hidden_states, _ = self.transformer_block(
+            hidden_states, full_hidden_states = self.transformer_block(
                 input_ids=input_ids,
                 src=inputs_embeds,
                 cum_offsets=cum_offsets,
@@ -1508,17 +1570,11 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
             )
         hidden_states = self.norm(hidden_states)
 
-        return BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=hidden_states,
-            past_key_values=None,
-            hidden_states=None,
-            attentions=None,
-            cum_offsets=cum_offsets,
-        )
+        return hidden_states, full_hidden_states
 
 
 @register_base_model
-class EagleForLlamaInferenceModel(LlamaBlockInferenceModel):
+class EagleForLlamaBlockInferenceModel(LlamaBlockInferenceModel):
     def __init__(self, config: LlamaConfig):
         self.append_attn = config.append_attn
         super().__init__(config)
@@ -1528,7 +1584,11 @@ class EagleForLlamaInferenceModel(LlamaBlockInferenceModel):
 
         if config.tensor_parallel_degree > 1:
             self.fc = ColumnParallelLinear(
-                self.hidden_size * 2, self.hidden_size, has_bias=True, gather_output=True, fuse_matmul_bias=True
+                self.hidden_size * 2,
+                self.hidden_size,
+                has_bias=True,
+                gather_output=True,
+                fuse_matmul_bias=True,
             )
         else:
             self.fc = nn.Linear(self.hidden_size * 2, self.hidden_size, bias_attr=True)
@@ -1688,7 +1748,11 @@ class LlamaForCausalLMInferenceModel(GenerationInferenceModel, LlamaPretrainedMo
         super().__init__(config)
         self.llama = LlamaInferenceModel(config)
         if config.tie_word_embeddings:
-            self.lm_head = LlamaLMHead(config, embedding_weights=self.llama.embed_tokens.weight, transpose_y=True)
+            self.lm_head = LlamaLMHead(
+                config,
+                embedding_weights=self.llama.embed_tokens.weight,
+                transpose_y=True,
+            )
             self.tie_weights()
         else:
             self.lm_head = LlamaLMHead(config)
@@ -1886,7 +1950,11 @@ class LlamaForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, LlamaPr
 
         self.llama = LlamaBlockInferenceModel(config)
         if config.tie_word_embeddings:
-            self.lm_head = LlamaLMHead(config, embedding_weights=self.llama.embed_tokens.weight, transpose_y=True)
+            self.lm_head = LlamaLMHead(
+                config,
+                embedding_weights=self.llama.embed_tokens.weight,
+                transpose_y=True,
+            )
             self.tie_weights()
         else:
             self.lm_head = LlamaLMHead(config)
@@ -2078,8 +2146,9 @@ class LlamaForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, LlamaPr
         excess_blocks=None,
         draft_tokens=None,
         output_padding_offset=None,
+        **kwargs,
     ):
-        outputs = self.llama(
+        hidden_states, full_hidden_states = self.llama(
             input_ids,
             src_mask=src_mask,
             caches=caches,
@@ -2096,24 +2165,9 @@ class LlamaForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, LlamaPr
             excess_blocks=excess_blocks,
             draft_tokens=draft_tokens,
             output_padding_offset=output_padding_offset,
+            **kwargs,
         )
-        # hidden_states = outputs[0]
-        if self.return_full_hidden_states:
-            from paddlenlp_ops import rebuild_padding_v2
 
-            # full_hidden_states = outputs[1]
-            full_hidden_states = outputs[0]
-            cum_offsets = outputs[1]
-            hidden_states = rebuild_padding_v2(
-                full_hidden_states,
-                cum_offsets,
-                seq_lens_decoder,
-                seq_lens_encoder,
-                output_padding_offset,
-                self.max_seq_len,
-            )
-        else:
-            hidden_states = outputs[0]
         logits = self.lm_head(
             hidden_states,
             tensor_parallel_output=False,
@@ -2139,9 +2193,13 @@ class EagleLlamaForCausalLMBlockInferenceModel(LlamaForCausalLMBlockInferenceMod
         self.verify_window = config.get("speculate_verify_window", 2)
         self.max_seq_len = config.max_seq_len
 
-        self.eagle = EagleForLlamaInferenceModel(config)
+        self.eagle = EagleForLlamaBlockInferenceModel(config)
         if config.tie_word_embeddings:
-            self.lm_head = LlamaLMHead(config, embedding_weights=self.llama.embed_tokens.weight, transpose_y=True)
+            self.lm_head = LlamaLMHead(
+                config,
+                embedding_weights=self.llama.embed_tokens.weight,
+                transpose_y=True,
+            )
             self.tie_weights()
         else:
             self.lm_head = LlamaLMHead(config)

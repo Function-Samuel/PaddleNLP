@@ -14,6 +14,7 @@
 # import inspect
 import json
 import logging
+import math
 import os
 import sys
 from functools import partial
@@ -30,6 +31,8 @@ from paddlenlp.datasets import (
 )
 from paddlenlp.metrics import BLEU, Rouge1, Rouge2, RougeL
 from paddlenlp.peft import (
+    DisLoRAConfig,
+    DisLoRAModel,
     LoKrConfig,
     LoKrModel,
     LoRAConfig,
@@ -67,7 +70,7 @@ from paddlenlp.transformers import (
 )
 from paddlenlp.transformers.configuration_utils import LlmMetaConfig
 from paddlenlp.transformers.longlora import replace_llama_attn, set_group_size
-from paddlenlp.trl import DataConfig, ModelConfig, SFTConfig, SFTTrainer
+from paddlenlp.trl import DataConfig, DisLoRATrainer, ModelConfig, SFTConfig, SFTTrainer
 from paddlenlp.trl.llm_utils import (
     ZeroPaddingIterDatasetCallback,
     compute_metrics,
@@ -76,6 +79,7 @@ from paddlenlp.trl.llm_utils import (
     init_chat_template,
 )
 from paddlenlp.utils.log import logger
+from paddlenlp.utils.optimizer import AdamWLoRAPro
 from paddlenlp.utils.tools import get_env_device
 
 # Fine-tune Environment Variables to support sharding stage1 overlap optimization.
@@ -164,6 +168,13 @@ def main():
         qlora_weight_blocksize=model_args.qlora_weight_blocksize,
         qlora_weight_double_quant=model_args.qlora_weight_double_quant,
         qlora_weight_double_quant_block_size=model_args.qlora_weight_double_quant_block_size,
+        apply_hadamard=model_args.apply_hadamard,
+        hadamard_block_size=model_args.hadamard_block_size,
+        quant_input_grad=model_args.quant_input_grad,
+        quant_weight_grad=model_args.quant_weight_grad,
+        apply_online_actscale_step=model_args.apply_online_actscale_step,
+        actscale_moving_rate=model_args.actscale_moving_rate,
+        fp8_format_type=model_args.fp8_format_type,
     )
 
     model_config = AutoConfig.from_pretrained(
@@ -302,6 +313,15 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     train_ds, dev_ds, test_ds = create_dataset(data_args, training_args)
+
+    train_dataset_size = None
+    if train_ds is not None and model_args.dislora:
+        train_dataset_size = get_dataset_size(train_ds)
+        if train_dataset_size is not None:
+            logger.info(f"Original training dataset size: {train_dataset_size}")
+        else:
+            logger.warning("Unable to determine training dataset size for dynamic dash_flag calculation")
+
     # TODO(ZHUI & sijunhe): Temporary implementation. Generalize this logic and move to Trainer later.
     if training_args.resume_from_checkpoint is not None and data_args.lazy:
         logger.info(
@@ -368,7 +388,9 @@ def main():
         if eval_zero_padding and test_ds is not None:
             test_ds = intoken_dataset(test_ds, tokenizer=tokenizer, max_length=data_args.max_length)
 
-    model = create_peft_model(model_args, reft_args, training_args, dtype, model_config, model, reft_layers)
+    model = create_peft_model(
+        model_args, reft_args, training_args, dtype, model_config, model, reft_layers, train_dataset_size
+    )
 
     def compute_metrics_do_generation(eval_preds):
         rouge1 = Rouge1()
@@ -432,21 +454,43 @@ def main():
         return_attention_mask=not model_args.flash_mask,
         pad_to_multiple_of=data_args.pad_to_multiple_of,
     )
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=dev_ds,
-        tokenizer=tokenizer,
-        compute_metrics=metrics,
-        data_collator=data_collator_fn if not model_args.reft else ReftDataCollator(data_collator=data_collator_fn),
-        do_generation=data_args.eval_with_do_generation,
-        callbacks=[ZeroPaddingIterDatasetCallback()] if isinstance(train_ds, ZeroPaddingIterableDataset) else None,
-        gen_args=gen_args,
-        data_args=data_args,
-    )
-    trainable_parameters = [p for p in model.parameters() if not p.stop_gradient]
+
+    if model_args.dislora and hasattr(model_args, "ortho_lambda"):
+        training_args.dislora_ortho_lambda = model_args.ortho_lambda
+
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_ds,
+        "eval_dataset": dev_ds,
+        "tokenizer": tokenizer,
+        "compute_metrics": metrics,
+        "data_collator": data_collator_fn if not model_args.reft else ReftDataCollator(data_collator=data_collator_fn),
+        "do_generation": data_args.eval_with_do_generation,
+        "callbacks": [ZeroPaddingIterDatasetCallback()] if isinstance(train_ds, ZeroPaddingIterableDataset) else None,
+        "gen_args": gen_args,
+        "data_args": data_args,
+    }
+
+    if model_args.dislora:
+        logger.info("Using DisLoRATrainer for training.")
+        trainer = DisLoRATrainer(**trainer_kwargs)
+    else:
+        trainer = SFTTrainer(**trainer_kwargs)
+
+    trainable_parameters = [
+        p for p in model.parameters() if not p.stop_gradient or ("quantization_linear" in p.name and "w_1" in p.name)
+    ]
     trainer.set_optimizer_grouped_parameters(trainable_parameters)
+    if model_args.lorapro:
+        optimizer = AdamWLoRAPro(
+            learning_rate=training_args.learning_rate,
+            parameters=trainable_parameters,
+            weight_decay=training_args.weight_decay,
+            scaling_factor=model_args.lorapro_scaling_factor,
+            x_mode=model_args.lorapro_x_mode,
+        )
+        trainer.optimizer = optimizer
 
     # Train
     if training_args.do_train:
@@ -511,7 +555,9 @@ def save_to_aistudio(model_args, training_args, trainer):
     )
 
 
-def create_peft_model(model_args, reft_args, training_args, dtype, model_config, model, reft_layers):
+def create_peft_model(
+    model_args, reft_args, training_args, dtype, model_config, model, reft_layers, train_dataset_size
+):
     if model_args.prefix_tuning:
         if training_args.pipeline_parallel_degree > 1:
             raise NotImplementedError("Prefix tuning is not implemented for pipeline parallelism.")
@@ -560,7 +606,19 @@ def create_peft_model(model_args, reft_args, training_args, dtype, model_config,
                 use_quick_lora=model_args.use_quick_lora,
                 lora_use_mixer=model_args.lora_use_mixer,
                 use_mora=model_args.use_mora,
+<<<<<<< HEAD
+                nola=model_args.nola,
+                nola_basis_num=model_args.nola_basis_num,
+=======
+                mixer_num=model_args.mixer_num,
+>>>>>>> upstream/develop
+                lorapro=model_args.lorapro,
             )
+            if model_args.lorapro:
+                if model_args.rslora:
+                    model_args.lorapro_scaling_factor = lora_config.lora_alpha / math.sqrt(lora_config.r)
+                else:
+                    model_args.lorapro_scaling_factor = lora_config.lora_alpha / lora_config.r
             model = LoRAModel(model, lora_config)
         else:
             model = LoRAModel.from_pretrained(model=model, lora_path=model_args.lora_path)
@@ -579,6 +637,53 @@ def create_peft_model(model_args, reft_args, training_args, dtype, model_config,
             model = LoKrModel(model, lokr_config)
         else:
             model = LoKrModel.from_pretrained(model=model, lokr_path=model_args.lokr_path)
+
+    if model_args.dislora:
+        # Calculate dynamic dash_flag based on training configuration
+        if train_dataset_size is not None and training_args.do_train:
+            # Calculate warmup steps: len(train_data) * num_epochs // (batch_size * gradient_accumulation_steps * 3)
+            effective_batch_size = (
+                training_args.per_device_train_batch_size
+                * training_args.gradient_accumulation_steps
+                * training_args.dataset_world_size  # Consider data parallel
+            )
+            calculated_dash_flag = (train_dataset_size * training_args.num_train_epochs) // (effective_batch_size * 3)
+
+            # Use calculated value if it's reasonable, otherwise fall back to model_args
+            if calculated_dash_flag > 0:
+                dash_flag = calculated_dash_flag
+                logger.info(
+                    f"Calculated dynamic dash_flag: {dash_flag} based on dataset size: {train_dataset_size}, "
+                    f"epochs: {training_args.num_train_epochs}, effective batch size: {effective_batch_size}"
+                )
+            else:
+                dash_flag = model_args.dash_flag
+                logger.warning(
+                    f"Calculated dash_flag was {calculated_dash_flag}, using model_args.dash_flag: {dash_flag}"
+                )
+        else:
+            dash_flag = getattr(model_args, "dash_flag", 50)
+            if train_dataset_size is None:
+                logger.info(
+                    f"Unable to calculate dynamic dash_flag (dataset size unknown), using configured dash_flag: {dash_flag}"
+                )
+            else:
+                logger.info(f"Not in training mode, using configured dash_flag: {dash_flag}")
+        if model_args.dislora_path is None:
+            dislora_config = DisLoRAConfig(
+                target_modules=model_args.target_modules
+                if model_args.target_modules
+                else get_lora_target_modules(model),
+                r=model_args.dislora_rank,
+                dislora_alpha=1.5 * model_args.dislora_rank,
+                dislora_dropout=model_args.dislora_dropout,
+                dtype=dtype,
+                base_model_name_or_path=model_args.model_name_or_path,
+                s_tsd=model_args.s_tsd,
+                dash_flag=dash_flag,  # Use calculated dash_flag
+                ortho_lambda=model_args.ortho_lambda,
+            )
+        model = DisLoRAModel(model, dislora_config)
 
     if model_args.reft:
         intervention_dtype = dtype
@@ -717,6 +822,25 @@ def create_dataset(data_args, training_args):
             test_ds = load_dataset(data_args.dataset_name_or_path, splits=["test"])[0]
 
     return train_ds, dev_ds, test_ds
+
+
+def get_dataset_size(dataset):
+    """Get the size of a dataset, handling both lazy and regular datasets"""
+    if dataset is None:
+        return None
+
+    try:
+        if hasattr(dataset, "__len__"):
+            return len(dataset)
+        elif hasattr(dataset, "_length"):
+            return dataset._length
+        else:
+            # For lazy datasets, we might need to iterate once to count
+            logger.warning("Unable to determine dataset size directly for lazy loading dataset")
+            return None
+    except Exception as e:
+        logger.warning(f"Error getting dataset size: {e}")
+        return None
 
 
 if __name__ == "__main__":

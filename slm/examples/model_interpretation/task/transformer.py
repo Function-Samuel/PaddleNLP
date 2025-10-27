@@ -264,7 +264,7 @@ class MultiHeadAttention(Layer):
 
     def gen_cache(self, key, value=None, type=Cache):
         """
-        Generates cache for `forward` usage in inference accroding to arguments.
+        Generates cache for `forward` usage in inference according to arguments.
         The generated cache is an instance of `MultiHeadAttention.Cache` or an
         instance of `MultiHeadAttention.StaticCache`.
 
@@ -430,7 +430,7 @@ class TransformerEncoderLayer(Layer):
             in MHA to drop some attention target. If None, use the value of
             `dropout`. Default None
         act_dropout (float, optional): The dropout probability used after FFN
-            activition.  If None, use the value of `dropout`. Default None
+            activation.  If None, use the value of `dropout`. Default None
         normalize_before (bool, optional): Indicate whether to put layer normalization
             into preprocessing of MHA and FFN sub-layers. If True, pre-process is layer
             normalization and post-precess includes dropout, residual connection.
@@ -723,7 +723,7 @@ class TransformerDecoderLayer(Layer):
             in MHA to drop some attention target. If None, use the value of
             `dropout`. Default None
         act_dropout (float, optional): The dropout probability used after FFN
-            activition.  If None, use the value of `dropout`. Default None
+            activation.  If None, use the value of `dropout`. Default None
         normalize_before (bool, optional): Indicate whether to put layer normalization
             into preprocessing of MHA and FFN sub-layers. If True, pre-process is layer
             normalization and post-precess includes dropout, residual connection.
@@ -1063,7 +1063,7 @@ class Transformer(Layer):
     Please refer to `Attention is all you need <http://papers.nips.cc/paper/7181-attention-is-all-you-need.pdf>`_ ,
     and see `TransformerEncoder` and `TransformerDecoder` for more details.
 
-    Users can configurate the model architecture with corresponding parameters.
+    Users can configure the model architecture with corresponding parameters.
     Note the usage of `normalize_before` representing where to apply layer
     normalization (in pre-process or post-precess of multi-head attention or FFN),
     and some transformer like models are different on this, such as
@@ -1086,7 +1086,7 @@ class Transformer(Layer):
             in MHA to drop some attention target. If None, use the value of
             `dropout`. Default None
         act_dropout (float, optional): The dropout probability used after FFN
-            activition.  If None, use the value of `dropout`. Default None
+            activation.  If None, use the value of `dropout`. Default None
         normalize_before (bool, optional): Indicate whether to put layer normalization
             into preprocessing of MHA and FFN sub-layers. If True, pre-process is layer
             normalization and post-precess includes dropout, residual connection.

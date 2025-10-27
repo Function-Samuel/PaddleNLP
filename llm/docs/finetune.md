@@ -94,7 +94,7 @@ python  -u  -m paddle.distributed.launch --gpus "0,1,2,3,4,5,6,7"  run_finetune.
 3. 可以通过设置`weight_quantize_algo`将主干模型量化低比特，例如'weight_only_int4','weight_only_int8'，'nf4'或'fp4'。具体参考精调参数介绍
 4. 设置`use_flash_attention`为 True 使用 FlashAttention。在 FlashAttention 打开的基础上设置`flash_mask`为 True 使用 FlashMask。
 5. LoRA API 支持4D 并行策略，可以通过控制`tensor_parallel_degree`、`pipeline_parallel_degree`、 `sharding`、`sharding_parallel_degree`调整并行训练策略，可拓展至**单机 LoRA 微调千亿模型**。
-6. 可配置`rslora`、`lora_plus_scale`、`pissa`、`lora_use_mixer`、`use_mora`等参数，使用 rsLoRA、LoRa+、PiSSA、MosLoRA（暂不支持张量模型并行）、MoRA（暂不支持张量模型并行） 等算法。
+6. 可配置`rslora`、`lora_plus_scale`、`pissa`、`lora_use_mixer`、`mixer_num`、`use_mora`等参数，使用 rsLoRA、LoRa+、PiSSA、MosLoRA（暂不支持张量模型并行）、LinChain（暂不支持张量模型并行）、MoRA（暂不支持张量模型并行） 等算法。
 
 为了后续的**压缩**和**静态图推理**方便，我们提供 LoRA 参数合并脚本，可以将 LoRA 参数合并到主干模型并保存相应的权重。
 ```
@@ -177,7 +177,33 @@ python merge_lokr_params.py \
 - `device`: 运行环境，默认为 gpu。
 </div>
 
-#### 3.4.4 ReFT
+#### 3.4.5 DisLoRA
+```
+# 单卡DisLoRA
+python  run_finetune.py ./config/llama/dislora_argument.json
+
+# 多卡DisLoRA（暂不支持张量模型并行）
+python  -u  -m paddle.distributed.launch --gpus "0,1,2,3,4,5,6,7"  run_finetune.py ./config/llama/dislora_argument.json
+```
+为了后续的**压缩**和**静态图推理**方便，我们提供 DisLoRA 参数合并脚本，可以将 DisLoRA 参数合并到主干模型并保存相应的权重。
+```
+python merge_dislora_params.py \
+    --model_name_or_path ./base_model \
+    --dislora_path ./checkpoints/dislora_ckpts \
+    --merge_dislora_model_path ./checkpoints/dislora_merge \
+    --device "gpu" \
+    --low_gpu_mem True
+```
+
+<summary>&emsp; 脚本参数介绍</summary><div>
+
+- `dislora_path`: DisLoRA 参数和配置路径，对 DisLoRA 参数进行初始化，默认为 None。
+- `model_name_or_path`: 必须，主干模型参数路径，默认为 None。
+- `merge_dislora_model_path`: 必须，合并参数后保存路径，默认为 None。
+- `device`: 运行环境，默认为 gpu。
+</div>
+
+#### 3.4.6 ReFT
 ```
 # 单卡ReFT
 python  run_finetune.py ./config/llama/reft_argument.json
@@ -228,6 +254,8 @@ python ./predict/reft_predictor.py \
 - `vera_rank`: VeRA 算法中 rank（秩）的值，默认为8。
 - `lokr`: 是否开启 [LoKr](https://arxiv.org/abs/2309.14859) 微调策略，默认为 False。
 - `lokr_rank`: LoKr 算法中 rank（秩）的值，默认为8。
+- `dislora`: 是否开启 [DisLoRA] 微调策略，默认为 False。
+- `dislora_rank`: DisLoRA 算法中 rank（秩）的值，默认为8。
 - `use_long_sequence_strategies`: 是否使用长序列扩展策略，默认为 False。
 - `reft`: 是否开启 [ReFT](https://arxiv.org/abs/2404.03592) 微调策略，默认为 False。
 - `use_mora`: 是否开启 [MoRA](https://arxiv.org/abs/2405.12130) 微调策略，默认为 False。
@@ -236,6 +264,7 @@ python ./predict/reft_predictor.py \
 - `strategy_type`: 长序列扩展策略的类型，默认为 None。
 - `strategy_name`: 长序列扩展策略的具体名称，默认为 None。
 - `rope_scaling_factor`: 应用 RoPE 扩展策略时的缩放因子。
+- `lorapro`: 是否开启 LoRA-Pro 策略。
 </div>
 
 <summary>&emsp; 数据参数（DataArgument）</summary><div>

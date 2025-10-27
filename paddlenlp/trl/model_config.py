@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 __all__ = ["ModelConfig"]
 
@@ -47,25 +47,6 @@ class ModelConfig:
             "help": "Whether to train from existing paddlenlp model weights. If set True, the model_name_or_path argument must exist in the paddlenlp models."
         },
     )
-    weight_quantize_algo: str = field(
-        default=None,
-        metadata={
-            "help": "Model weight quantization algorithm including 'nf4', 'fp4','weight_only_int4', 'weight_only_int8'."
-        },
-    )
-    qlora_weight_blocksize: int = field(
-        default=64,
-        metadata={"help": "Block size for weight quantization(Only available for nf4 or fp4 quant_scale.)."},
-    )
-    qlora_weight_double_quant: bool = field(
-        default=False, metadata={"help": "Whether apply double quant(Only available for nf4 or fp4 quant_scale.)."}
-    )
-    qlora_weight_double_quant_block_size: int = field(
-        default=256,
-        metadata={
-            "help": "Block size for quant_scale of weight quant_scale(Only available for nf4 or fp4 quant_scale.)"
-        },
-    )
 
     # LoRA related parameters
     lora: bool = field(default=False, metadata={"help": "Whether to use LoRA technique"})
@@ -83,8 +64,22 @@ class ModelConfig:
     lora_use_mixer: bool = field(
         default=False, metadata={"help": "Whether to use MosLoRA: https://arxiv.org/pdf/2406.11909"}
     )
+    nola: bool = field(default=False, metadata={"help": "Whether to use Nola: https://arxiv.org/pdf/2310.02556"})
+    nola_basis_num: int = field(default=1, metadata={"help": "When use nola, the number of basis"})
+    mixer_num: int = field(default=1, metadata={"help": "Num of mixer matrices."})
     use_mora: bool = field(
         default=False, metadata={"help": "Whether to use MoRA: https://arxiv.org/pdf/2405.12130.pdf"}
+    )
+    lorapro: bool = field(
+        default=False, metadata={"help": "Whether to use LoRA-Pro: https://arxiv.org/pdf/2407.18242"}
+    )
+    lorapro_x_mode: str = field(
+        default="zero",
+        metadata={"help": "X mode for AdamWLoRAPro optimizer (zero, sylvester, symmetry)."},
+    )
+    lorapro_scaling_factor: float = field(
+        default=2.0,
+        metadata={"help": "Scaling factor for AdamWLoRAPro optimizer."},
     )
 
     # vera related parameters
@@ -97,6 +92,27 @@ class ModelConfig:
         default=None, metadata={"help": "Initialize lokr state dict and apply customized lokr config"}
     )
     lokr_dim: int = field(default=8, metadata={"help": "Lora dimension in LoKr dimension for adapter matrix"})
+
+    # dislora related parameters
+    dislora: bool = field(default=False, metadata={"help": "Whether to use dislora technique"})
+    dislora_path: str = field(default=None, metadata={"help": "Initialize dislora state dict."})
+    dislora_rank: int = field(default=8, metadata={"help": "DisLoRA attention dimension"})
+    dislora_dropout: float = field(default=0.05, metadata={"help": "DisLoRA dropout"})
+    target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Custom target modules for DisLoRA. If None, will use default modules based on model type."},
+    )
+    dash_flag: int = field(
+        default=50, metadata={"help": "The number of preheating steps before introducing additional low-rank updates"}
+    )
+    s_tsd: int = field(
+        default=8, metadata={"help": "The number of top-k singular vectors dynamically selected after preheating"}
+    )
+    ortho_lambda: float = field(default=1, metadata={"help": "The weight of orthogonal regularization loss"})
+    prefer_small_sigma: bool = field(
+        default=True,
+        metadata={"help": "Whether to prioritize the smallest singular value in the top-k selection process"},
+    )
 
     # prefix tuning related parameters
     prefix_tuning: bool = field(default=False, metadata={"help": "Whether to use Prefix technique"})
@@ -123,3 +139,33 @@ class ModelConfig:
     rope_scaling_factor: float = field(default=1.0, metadata={"help": "Rope extension scaling factor"})
     strategy_type: str = field(default=None, metadata={"help": "Long sequence strategy type"})
     strategy_name: str = field(default=None, metadata={"help": "Long sequence strategy name"})
+
+    # Quantization Training Related
+    weight_quantize_algo: str = field(
+        default=None,
+        metadata={
+            "help": "Model weight quantization algorithm including 'nf4', 'fp4','weight_only_int4', 'weight_only_int8'."
+        },
+    )
+    qlora_weight_blocksize: int = field(
+        default=64,
+        metadata={"help": "Block size for weight quantization(Only available for nf4 or fp4 quant_scale.)."},
+    )
+    qlora_weight_double_quant: bool = field(
+        default=False, metadata={"help": "Whether apply double quant(Only available for nf4 or fp4 quant_scale.)."}
+    )
+    qlora_weight_double_quant_block_size: int = field(
+        default=256,
+        metadata={
+            "help": "Block size for quant_scale of weight quant_scale(Only available for nf4 or fp4 quant_scale.)"
+        },
+    )
+    apply_hadamard: bool = field(default=False, metadata={"help": "Whether to apply hadamard"})
+    hadamard_block_size: int = field(default=32, metadata={"help": "hadamard block size"})
+    quant_input_grad: bool = field(default=False, metadata={"help": "Whether to quantize input grad"})
+    quant_weight_grad: bool = field(default=False, metadata={"help": "Whether to quantize weight grad"})
+    apply_online_actscale_step: int = field(
+        default=200, metadata={"help": "Use online activation scale for first N step to keep stable training."}
+    )
+    actscale_moving_rate: float = field(default=0.01, metadata={"help": "EMA moving_rate for activation scale"})
+    fp8_format_type: str = field(default="hybrid", metadata={"help": "FP8 Format"})

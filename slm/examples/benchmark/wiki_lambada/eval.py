@@ -74,7 +74,7 @@ def get_parser():
         help="Whether to use flash attention",
     )
     # load autodist name files, eg: bloom-176b
-    parser.add_argument("--load_autodist", action="store_true", help="whether load auto-dist wieght file")
+    parser.add_argument("--load_autodist", action="store_true", help="whether load auto-dist weight file")
 
     return parser
 
@@ -123,7 +123,7 @@ class LM_Eval_Dataset(paddle.io.Dataset):
         labels = tokens[1:]
         tokens = tokens[:-1]
         seq_length = len(tokens)
-        # attention mask for the attention calulate
+        # attention mask for the attention calculate
         attention_mask = np.tri(seq_length, seq_length).reshape((1, seq_length, seq_length))
 
         # the pad and eos tokens do not contribute the loss
@@ -168,7 +168,7 @@ class Lambada_Eval_Dataset(paddle.io.Dataset):
         tokens = tokens[:-1]
 
         seq_length = len(tokens)
-        # attention mask for the attention calulate
+        # attention mask for the attention calculate
         attention_mask = np.tri(seq_length, seq_length).reshape((1, seq_length, seq_length))
 
         # the pad and eos tokens do not contribute the loss

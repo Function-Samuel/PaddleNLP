@@ -31,7 +31,7 @@ class Encoder(nn.Layer):
         """
         super(Encoder, self).__init__()
         self.config = config
-        # Don't add ernie to self, oterwise, there will be more copies of ernie weights
+        # Don't add ernie to self, otherwise, there will be more copies of ernie weights
         # self.ernie = ernie
 
     @classmethod
@@ -67,7 +67,7 @@ class ErnieSageV2Encoder(Encoder):
             ernie (nn.Layer): the ernie model.
         """
         super(ErnieSageV2Encoder, self).__init__(config)
-        # Don't add ernie to self, oterwise, there will be more copies of ernie weights
+        # Don't add ernie to self, otherwise, there will be more copies of ernie weights
         # self.ernie = ernie
         self.convs = nn.LayerList()
         fc_lr = self.config.lr / 0.001
@@ -95,7 +95,7 @@ class ErnieSageV2Encoder(Encoder):
         """Gather the final feature.
 
         Args:
-            feature (Tensor): the total featue tensor.
+            feature (Tensor): the total feature tensor.
             index (Tensor): the index to gather.
 
         Returns:

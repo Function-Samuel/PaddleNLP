@@ -153,11 +153,11 @@ class ErnieSageV2Conv(nn.Layer):
         return self_feature, neigh_feature
 
     def forward(self, graph, term_ids, act="relu"):
-        """Forward funciton of Conv layer.
+        """Forward function of Conv layer.
 
         Args:
             graph (Graph): Graph object.
-            feature (Tensor): node feture.
+            feature (Tensor): node feature.
             act (str, optional): activation function. Defaults to 'relu'.
 
         Returns:

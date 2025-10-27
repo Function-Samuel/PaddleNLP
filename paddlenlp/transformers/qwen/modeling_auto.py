@@ -538,7 +538,7 @@ class QWenModelAuto(QWenPretrainedModelAuto):
         self.recompute_granularity = config.recompute_granularity
 
         self.wte = nn.Embedding(self.vocab_size, self.embed_dim)
-        self.wte.weight = dist.shard_tensor(self.wte.weight, get_mesh(), [dist.Replicate(), dist.Shard(0)])
+        self.wte.weight = dist.shard_tensor(self.wte.weight, get_mesh(), [dist.Replicate(), dist.Shard(1)])
         self.drop = nn.Dropout(config.emb_dropout_prob)
 
         self.h = nn.LayerList(
@@ -675,6 +675,7 @@ class QWenModelAuto(QWenPretrainedModelAuto):
                 inputs_embeds = self.wte(input_ids)
 
         hidden_states = inputs_embeds
+        hidden_states = dist.reshard(hidden_states, get_mesh(), [dist.Shard(0), dist.Replicate()])
 
         use_casual_mask = get_use_casual_mask()
         if use_casual_mask:

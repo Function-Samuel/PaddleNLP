@@ -31,6 +31,11 @@ import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
 
+try:
+    from paddle.distributed.fleet.base.topology import message2nccl_config
+except ImportError:
+    message2nccl_config = None
+
 from ..utils.env import PREFIX_CHECKPOINT_DIR
 from ..utils.log import logger
 from ..utils.pdc_sdk import FLASH_DEVICE
@@ -39,6 +44,7 @@ from .trainer_utils import (
     OptimizerNames,
     SchedulerType,
     ShardingOption,
+    init_nccl_config,
     split_parallel_config,
 )
 
@@ -376,7 +382,7 @@ class TrainingArguments:
             instance of `Dataset`.
         report_to (`str` or `List[str]`, *optional*, defaults to `"visualdl"`):
             The list of integrations to report the results and logs to.
-            Supported platforms are `"visualdl"`/`"wandb"`/`"tensorboard"`.
+            Supported platforms are `"visualdl"`/`"wandb"`/`"tensorboard"`/`"swanlab"`.
             `"none"` for no integrations.
         ddp_find_unused_parameters (`bool`, *optional*):
             When using distributed training, the value of the flag `find_unused_parameters` passed to
@@ -401,6 +407,12 @@ class TrainingArguments:
             Whether to release gradients during training. Default is `False`.
         ckpt_quant_stage (`str`, *optional*):
             Whether activate checkpoint quantization. O0: deactivate, O1: Int8 compression, O2: Int4 compression. (default: O0).
+        save_checkpoint_format (`str`, *optional*):
+            Specifies the format for saving checkpoints. Options are: None, 'sharding_io', 'unified_checkpoint', 'flex_checkpoint'. (default: None). This setting is ignored if the corresponding switch is configured.
+        load_checkpoint_format (`str`, *optional*):
+            Specifies the format for loading checkpoints. Options are: None, 'sharding_io', 'unified_checkpoint', 'flex_checkpoint'. (default: None). This setting is ignored if the corresponding switch is configured.
+        aoa_config (`Optional[dict[str, list[str]]]`, *optional*):
+            The AoA configuration of FlexCheckpoint, used to describe the mapping between model weights and the checkpoint content. Default is None.
     """
 
     output_dir: str = field(
@@ -608,6 +620,16 @@ class TrainingArguments:
             )
         },
     )
+    sharding_offload_opt_buffersize_GB: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Set the size of the optimizer offload buffer when need_hack_offload_optimizer() is True. This option only takes effect when "
+                "use DygraphShardingOptimizerV2. The default value is -1, which means that all of the optimizer states will be offloaded. Only "
+                "works when export HACK_OFFLOAD_OPTIMIZER=1. "
+            )
+        },
+    )
 
     save_sharded_model: bool = field(
         default=False,
@@ -625,6 +647,16 @@ class TrainingArguments:
                 "When use sharding stage1 and set load_sharded_model True, it means loading the sharded model. The sharded model is saved when we set save_sharded_model True."
             )
         },
+    )
+
+    load_sharded_model_remap_parameter_name: bool = field(
+        default=False,
+        metadata={"help": "Whether to remap parameter name when load_sharded_model = true."},
+    )
+
+    sharded_model_from_ema: bool = field(
+        default=False,
+        metadata={"help": "Whether to load sharded model from EMA."},
     )
 
     tensor_parallel_degree: int = field(
@@ -776,7 +808,7 @@ class TrainingArguments:
                 "Following options are supported:\n"
                 "- pp_first. the topo order is dp, pp, sharding, mp \n"
                 "- sharding_first. the topo order is dp, sharding, pp, mp \n"
-                "Default is None, for pp_first"
+                "Default is None, for sharding_first"
             )
         },
     )
@@ -868,6 +900,10 @@ class TrainingArguments:
         default="adamw",
         metadata={"help": "The optimizer to use."},
     )
+    use_lowprecision_moment: bool = field(
+        default=False,
+        metadata={"help": "AdamW use 16bit moment as model parameter."},
+    )
     report_to: Optional[List[str]] = field(
         default=None, metadata={"help": "The list of integrations to report the results and logs to."}
     )
@@ -910,6 +946,29 @@ class TrainingArguments:
     use_async_save: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to use async_save instead of paddle.save."},
+    )
+    save_checkpoint_format: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Specifies the format used to save checkpoints. "
+                "Available options: 'sharding_io', 'unified_checkpoint', "
+                "'flex_checkpoint'."
+                "This setting is ignored if the corresponding switch is configured."
+            )
+        },
+    )
+
+    load_checkpoint_format: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Specifies the format used to load checkpoints. "
+                "Available options: 'sharding_io', 'unified_checkpoint', "
+                "'flex_checkpoint'."
+                "This setting is ignored if the corresponding switch is configured."
+            )
+        },
     )
     ordered_save_group_size: int = field(
         default=0,
@@ -996,6 +1055,16 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Offload optimizer after optimizer.step()"},
     )
+    tensorwise_offload_optimizer: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": (
+                "Offload all optimizer states to CPU memory. "
+                "The corresponding parameters will only be loaded to GPU during optimizer step, "
+                "which reduces GPU memory usage but may increase step time."
+            )
+        },
+    )
     save_sharding_stage1_model_include_freeze_params: Optional[bool] = field(
         default=False, metadata={"help": "Save Sharding Stage1 Model Exclude Freeze Params"}
     )
@@ -1024,6 +1093,10 @@ class TrainingArguments:
     zcc_ema_interval: Optional[int] = field(
         default=1,
         metadata={"help": "Interval between updating EMA parameters."},
+    )
+    zcc_ema_loss_threshold: Optional[float] = field(
+        default=None,
+        metadata={"help": "If set not None, only do EMA when the training loss is smaller than the threshold value"},
     )
     save_tokenizer: Optional[bool] = field(
         default=True,
@@ -1058,10 +1131,26 @@ class TrainingArguments:
         metadata={"help": "是否开启单路sharding时global norm通信拆分全局通信组为pp通信和mp通信分别做"},
     )
 
+    nccl_comm_group_config: Optional[str] = field(
+        default=None, metadata={"help": "NCCL中通信组的细粒度控制的配置文件路径, 默认值为None, 代表不启用此项配置"}
+    )
+
+    aoa_config: Optional[dict[str, list[str]]] = field(
+        default=None,
+        metadata={
+            "help": "The AoA configuration of FlexCheckpoint, used to describe the mapping between model weights and the checkpoint content. Default is None."
+        },
+    )
+
     def __post_init__(self):
         world_size = paddle.distributed.get_world_size()
         if in_auto_parallel_align_mode():
-            self.max_grad_norm = 0.0
+            # self.max_grad_norm = 0.0
+            # The current auto_hybrid_pp has aligned the handling of ClipGradByGlobalNorm with the original dygraph semi-auto parallel and dynamic manual-parallel modes and can correctly handle grad_clip, so it is no longer necessary to set max_grad_norm=0.0.
+            if self.max_grad_norm != 0.0:
+                warnings.warn(
+                    "max_grad_norm is not 0.0,We will execute ClipGradByGlobalNorm,if you want to disable it,please set max_grad_norm=0.0"
+                )
             os.environ["FLAGS_max_inplace_grad_add"] = "65536"
             os.environ["FLAGS_embedding_deterministic"] = "1"
             os.environ["FLAGS_cudnn_deterministic"] = "1"
@@ -1157,7 +1246,8 @@ class TrainingArguments:
             raise ValueError("AdamW Mini currently doesn't support tensor parallelism.")
 
         self._post_init_parallel_degree()
-
+        self._post_init_save_checkpoint_format()
+        self._post_init_load_checkpoint_format()
         if self.to_static:
             assert world_size == 1 or self.enable_auto_parallel, (
                 "It's not supported for training in static mode except the following cases : "
@@ -1211,6 +1301,8 @@ class TrainingArguments:
                                 "use_dualpipev",
                                 "forward_backward_overlap_scheduler",
                                 "enable_dynamic_shape",
+                                "sync_moment",
+                                "sync_param",
                             ]:
                                 raise ValueError(
                                     f"Found unknown pipeline mode config {x}, accept config is disable_p2p_cache_shape, disable_partial_send_recv."
@@ -1263,6 +1355,18 @@ class TrainingArguments:
                         in pipeline_parallel_config,
                         "enable_dynamic_shape": "enable_dynamic_shape" in pipeline_parallel_config,
                     }
+
+                    pp_sync_param = "sync_param" in pipeline_parallel_config
+                    pp_sync_moment = "sync_moment" in pipeline_parallel_config
+
+                    if pp_sync_param:
+                        logger.info("setting pp sync_param")
+                        strategy.hybrid_configs["pp_configs"].sync_param = True
+
+                    if pp_sync_moment:
+                        logger.info("setting pp sync_moment")
+                        strategy.hybrid_configs["pp_configs"].sync_moment = True
+
                     if dygraph_pp_configs["dp_comm_overlap"]:
                         raise ValueError("overlap has accuracy issue")  # TODO: fix `overalap` + `delay_scale` issue
 
@@ -1359,6 +1463,17 @@ class TrainingArguments:
                         logger.warning("segment parallel is not supported!!!, Ignore it.")
                     return support_sep
 
+                def is_context_parallel_supported():
+                    import inspect
+
+                    members = [
+                        name for (name, date) in inspect.getmembers(fleet.base.topology.EPHybridCommunicateGroup)
+                    ]
+                    support_cp = "get_context_parallel_world_size" in members
+                    if not support_cp:
+                        logger.warning("context parallel is not supported!!! Ignore it.")
+                    return support_cp
+
                 if self.hybrid_parallel_topo_order == "pp_first":
                     if is_segment_parallel_supported():
                         order = ["dp", "pp", "sharding", "sep", "mp"]
@@ -1370,9 +1485,25 @@ class TrainingArguments:
                     else:
                         order = ["dp", "sharding", "pp", "mp"]
                 if self.use_expert_parallel:
-                    order = order[1:-1] + ["dp", "mp"]
+                    if self.moe_sharding_parallel_degree >= 1 and self.expert_parallel_degree > 1:
+                        if is_context_parallel_supported():
+                            order = ["sharding", "moe_sharding", "pp", "sep", "cp", "dp", "ep", "mp"]
+                        else:
+                            order = ["sharding", "moe_sharding", "pp", "sep", "dp", "ep", "mp"]
+                    else:
+                        order = ["sharding", "pp", "sep", "dp", "mp"]
 
-                if is_segment_parallel_supported():
+                if is_context_parallel_supported():
+                    hybrid_configs = {
+                        "dp_degree": self.data_parallel_degree,
+                        "mp_degree": self.tensor_parallel_degree,
+                        "pp_degree": self.pipeline_parallel_degree,
+                        "sharding_degree": self.sharding_parallel_degree,
+                        "sep_degree": self.sep_parallel_degree,
+                        "cp_degree": self.context_parallel_degree,
+                        "order": order,
+                    }
+                elif is_segment_parallel_supported():
                     hybrid_configs = {
                         "dp_degree": self.data_parallel_degree,
                         "mp_degree": self.tensor_parallel_degree,
@@ -1391,6 +1522,13 @@ class TrainingArguments:
                         "sharding_degree": self.sharding_parallel_degree,
                         "order": order,
                     }
+
+                if self.expert_parallel_degree > 1:
+                    assert (
+                        self.use_expert_parallel is True and self.moe_sharding_parallel_degree >= 0
+                    ), f"invalid expert_parallel_degree {self.expert_parallel_degree} and use_expert_paralle:{self.use_expert_parallel}."
+                    hybrid_configs["ep_degree"] = self.expert_parallel_degree
+                    hybrid_configs["moe_sharding_degree"] = self.moe_sharding_parallel_degree
 
                 try:
                     if self.split_norm_comm:
@@ -1443,6 +1581,11 @@ class TrainingArguments:
                         if self.sharding_comm_buffer_size_MB > 0:
                             strategy.hybrid_configs["sharding_configs"].comm_buffer_size_MB = int(
                                 self.sharding_comm_buffer_size_MB
+                            )
+
+                        if hasattr(strategy.hybrid_configs["sharding_configs"], "offload_opt_buffer_size"):
+                            strategy.hybrid_configs["sharding_configs"].offload_opt_buffer_size = int(
+                                self.sharding_offload_opt_buffersize_GB
                             )
 
                         if "split_param" in sharding_parallel_config:
@@ -1506,12 +1649,6 @@ class TrainingArguments:
                         assert (
                             "split_param" in sharding_parallel_config
                         ), "split_param should be set when enable_stage1_allgather_overlap."
-                        use_casual_mask = os.getenv("USE_CASUAL_MASK", "False")
-                        assert use_casual_mask, "enable_stage1_allgather_overlap requires USE_CASUAL_MASK=True."
-                        assert self.logging_steps > 1, (
-                            "The logging_steps should be greater than 1 for enable_stage1_allgather_overlap, "
-                            f"but got logging_steps={self.logging_steps}."
-                        )
 
                     if "split_param" in sharding_parallel_config:
                         if ShardingOption.SHARD_OP not in self.sharding:
@@ -1520,11 +1657,11 @@ class TrainingArguments:
                             self.amp_master_grad
                         ), "If `split_param` in sharding_parallel_config, `amp_master_grad` must be True."
 
+                if self.nccl_comm_group_config is not None:
+                    strategy = init_nccl_config(self.nccl_comm_group_config, strategy)
+
                 fleet.init(is_collective=True, strategy=strategy)
                 logger.info(strategy)
-
-                if self.expert_parallel_degree > 1:
-                    self.add_moe_comm_group()
 
         elif self.enable_auto_parallel:
             self.tensor_parallel_degree = max(self.tensor_parallel_degree, 1)
@@ -1539,10 +1676,7 @@ class TrainingArguments:
             if self.sharding_parallel_degree == -1:
                 if len(self.sharding) > 0:
                     self.sharding_parallel_degree = world_size // (
-                        self.tensor_parallel_degree
-                        * self.sep_parallel_degree
-                        * self.context_parallel_degree
-                        * self.pipeline_parallel_degree
+                        self.tensor_parallel_degree * self.sep_parallel_degree * self.pipeline_parallel_degree
                     )
 
             self.sharding_parallel_degree = max(self.sharding_parallel_degree, 1)
@@ -1722,12 +1856,25 @@ class TrainingArguments:
                 amp.custom_white_list = self.amp_custom_white_list if self.amp_custom_white_list is not None else []
 
             self.strategy = strategy
+            sep_degree = self.sep_parallel_degree if self.sep_parallel_degree > 1 else self.context_parallel_degree
             if self.hybrid_parallel_topo_order == "pp_first":
                 order = ["pp", "dp", "mp"]
-                degree = [self.pipeline_parallel_degree, self.dataset_world_size, self.tensor_parallel_degree]
+
+                degree = [
+                    self.pipeline_parallel_degree,
+                    self.dataset_world_size,
+                    self.tensor_parallel_degree,
+                ]
             elif self.hybrid_parallel_topo_order == "sharding_first":
                 order = ["dp", "pp", "mp"]
-                degree = [self.dataset_world_size, self.pipeline_parallel_degree, self.tensor_parallel_degree]
+                degree = [
+                    self.dataset_world_size,
+                    self.pipeline_parallel_degree,
+                    self.tensor_parallel_degree,
+                ]
+            if sep_degree > 1:
+                order.insert(-1, "sep")
+                degree.insert(-1, sep_degree)
             mesh_dims = list(zip(order, degree))
             fleet.auto.create_mesh(mesh_dims)
 
@@ -1746,6 +1893,7 @@ class TrainingArguments:
                 "dp_degree": self.dataset_world_size,
                 "mp_degree": self.tensor_parallel_degree,
                 "pp_degree": self.pipeline_parallel_degree,
+                "sep_degree": sep_degree,
                 "order": order,
             }
             fleet.init(is_collective=True, strategy=strategy)
@@ -1753,7 +1901,10 @@ class TrainingArguments:
         else:
             if world_size > 1:
                 if not paddle.distributed.parallel.parallel_helper._is_parallel_ctx_initialized():
-                    if self.unified_checkpoint:
+                    if self.save_checkpoint_format in [
+                        "unified_checkpoint",
+                        "flex_checkpoint",
+                    ] or self.load_checkpoint_format in ["unified_checkpoint", "flex_checkpoint"]:
                         # DP use hybrid group
                         strategy = fleet.DistributedStrategy()
                         fleet.init(is_collective=True, strategy=strategy)
@@ -1761,16 +1912,20 @@ class TrainingArguments:
                         paddle.distributed.init_parallel_env()
 
         if (
-            self.unified_checkpoint
+            (
+                self.save_checkpoint_format == "unified_checkpoint"
+                or self.load_checkpoint_format == "unified_checkpoint"
+            )
             and self.sharding_parallel_degree > 0
             and ShardingOption.FULL_SHARD in self.sharding
         ):
             logger.warning(
-                "Unified checkpoint currently do not support sharding stage3, set `unified_checkpoint` to False."
+                "Unified checkpoint currently do not support sharding stage3, disabling unified_checkpoint format."
             )
-            self.unified_checkpoint = False
+            self.save_checkpoint_format = None
+            self.load_checkpoint_format = None
 
-        if self.unified_checkpoint:
+        if self.save_checkpoint_format == "unified_checkpoint" or self.load_checkpoint_format == "unified_checkpoint":
             unified_checkpoint_config = set(self.unified_checkpoint_config.split(" "))
             if sys.platform.startswith("win") and "async_save" in self.unified_checkpoint_config:
                 raise ValueError("Currently do not support asynchronous saving for Windows system!")
@@ -1953,10 +2108,7 @@ class TrainingArguments:
             if self.sharding_parallel_degree == -1:
                 if len(self.sharding) > 0:
                     self.sharding_parallel_degree = world_size // (
-                        tensor_parallel_degree
-                        * sep_parallel_degree
-                        * context_parallel_degree
-                        * pipeline_parallel_degree
+                        tensor_parallel_degree * sep_parallel_degree * pipeline_parallel_degree
                     )
 
             sharding_parallel_degree = max(self.sharding_parallel_degree, 1)
@@ -1964,18 +2116,27 @@ class TrainingArguments:
                 logger.warning("sharding_parallel_degree=1 means no sharding, please set sharding to empty!")
                 self.sharding = []
 
-            if sharding_parallel_degree > 1:
-                assert (
-                    sharding_parallel_degree % expert_parallel_degree == 0
-                ), f"sharding_parallel_degree should be divided by expert_parallel_degree, current sharding_parallel_degree: {sharding_parallel_degree}, expert_parallel_degree: {expert_parallel_degree}."
-
             self.data_parallel_degree = world_size // (
-                sharding_parallel_degree
-                * tensor_parallel_degree
-                * sep_parallel_degree
-                * context_parallel_degree
-                * pipeline_parallel_degree
+                sharding_parallel_degree * tensor_parallel_degree * sep_parallel_degree * pipeline_parallel_degree
             )
+
+            if expert_parallel_degree > 1:
+                assert (
+                    self.expert_tensor_parallel_degree <= 1
+                ), "expert_tensor_parallel_degree > 1 is not supported when expert_parallel_degree > 1"
+                moe_sharding_parallel_degree = world_size // (pipeline_parallel_degree * expert_parallel_degree)
+            else:
+                moe_sharding_parallel_degree = 1
+            moe_sharding_parallel_degree = max(moe_sharding_parallel_degree, 1)
+            if moe_sharding_parallel_degree > 1 and self.data_parallel_degree > 1:
+                raise NotImplementedError(
+                    f"Currently only support use expert_data_parallel strategy together with sharding_parallel strategy, but not with data_parallel strategy. But got data_parallel_degree: {self.data_parallel_degree}, expert_parallel_degree: {expert_parallel_degree}, moe_sharding_parallel_degree: {moe_sharding_parallel_degree}."
+                )
+
+            if sharding_parallel_degree > 1 and moe_sharding_parallel_degree > 1:
+                assert (
+                    sharding_parallel_degree % moe_sharding_parallel_degree == 0
+                ), f"sharding_parallel_degree should be divided by moe_sharding_parallel_degree, current sharding_parallel_degree: {sharding_parallel_degree}, moe_sharding_parallel_degree: {moe_sharding_parallel_degree}."
 
             assert not (
                 self.data_parallel_degree > 1 and expert_parallel_degree > 1
@@ -1998,6 +2159,7 @@ class TrainingArguments:
                 self.context_parallel_degree = context_parallel_degree
                 self.expert_parallel_degree = expert_parallel_degree
                 self.expert_tensor_parallel_degree = expert_tensor_parallel_degree
+                self.moe_sharding_parallel_degree = moe_sharding_parallel_degree
 
             if not self.use_hybrid_parallel:
                 self.sharding = []
@@ -2010,13 +2172,38 @@ class TrainingArguments:
                 self.expert_tensor_parallel_degree = -1
 
         if self.hybrid_parallel_topo_order is None:
-            self.hybrid_parallel_topo_order = "pp_first"
+            self.hybrid_parallel_topo_order = "sharding_first"
         assert self.hybrid_parallel_topo_order in ["pp_first", "sharding_first"]
 
         if self.use_hybrid_parallel and self.enable_auto_parallel:
             self.use_hybrid_parallel = False
 
+    def _post_init_save_checkpoint_format(self):
+        if self.save_checkpoint_format:
+            valid_modes = ["unified_checkpoint", "sharding_io", "flex_checkpoint"]
+            assert (
+                self.save_checkpoint_format in valid_modes
+            ), f"Invalid save_checkpoint_format: {self.save_checkpoint_format}, Only these formats are allowed: {valid_modes}."
+        else:
+            if self.unified_checkpoint:
+                self.save_checkpoint_format = "unified_checkpoint"
+            elif self.save_sharded_model:
+                self.save_checkpoint_format = "sharding_io"
+
+    def _post_init_load_checkpoint_format(self):
+        if self.load_checkpoint_format:
+            valid_modes = ["unified_checkpoint", "sharding_io", "flex_checkpoint"]
+            assert (
+                self.load_checkpoint_format in valid_modes
+            ), f"Invalid load_checkpoint_format: {self.load_checkpoint_format}, Only these formats are allowed: {valid_modes}."
+        else:
+            if self.unified_checkpoint:
+                self.load_checkpoint_format = "unified_checkpoint"
+            elif self.load_sharded_model:
+                self.load_checkpoint_format = "sharding_io"
+
     def add_moe_comm_group(self):
+        hybrid_configs = fleet.fleet._user_defined_strategy.hybrid_configs
         hcg = fleet.get_hybrid_communicate_group()
         topo = hcg._topo
         sharding_parallel_groups = topo.get_comm_list("sharding")
@@ -2028,7 +2215,12 @@ class TrainingArguments:
             for i in range(experts_replicas):
                 rank_indices = list(range(i * self.expert_parallel_degree, (i + 1) * self.expert_parallel_degree))
                 ranks = [ranks_in_current_sharding_group[i] for i in rank_indices]
-                group = dist.new_group(ranks=ranks)
+                if message2nccl_config is not None and hybrid_configs.get("ep_configs", None) is not None:
+                    group = dist.new_group(
+                        ranks=ranks, nccl_config=message2nccl_config(hybrid_configs["ep_configs"].nccl_config, "ep")
+                    )
+                else:
+                    group = dist.new_group(ranks=ranks)
                 if dist.get_rank() in ranks:
                     assert not hasattr(hcg, "expert_parallel_group"), "expert_parallel_group can not be set repeate"
                     setattr(hcg, "expert_parallel_group", group)
@@ -2037,7 +2229,13 @@ class TrainingArguments:
             for i in range(self.expert_parallel_degree):
                 rank_indices = list(range(i, self.sharding_parallel_degree, self.expert_parallel_degree))
                 ranks = [ranks_in_current_sharding_group[i] for i in rank_indices]
-                group = dist.new_group(ranks=ranks)
+                if message2nccl_config is not None and hybrid_configs.get("ep_configs", None) is not None:
+                    group = dist.new_group(
+                        ranks=ranks,
+                        nccl_config=message2nccl_config(hybrid_configs["ep_configs"].grad_nccl_config, "ep_grad"),
+                    )
+                else:
+                    group = dist.new_group(ranks=ranks)
                 if dist.get_rank() in ranks:
                     assert not hasattr(hcg, "expert_grad_comm_group"), "expert_grad_comm_group can not be set repeate"
                     setattr(hcg, "expert_grad_comm_group", group)
@@ -2153,6 +2351,28 @@ class TrainingArguments:
         else:
             return 0
 
+    @property
+    def expert_parallel_rank(self):
+        if self.use_hybrid_parallel:
+            hcg = fleet.get_hybrid_communicate_group()
+            if hasattr(hcg, "get_expert_parallel_rank"):
+                return max(hcg.get_expert_parallel_rank(), 0)
+            else:
+                return 0
+        else:
+            return 0
+
+    @property
+    def context_parallel_rank(self):
+        if self.use_hybrid_parallel:
+            hcg = fleet.get_hybrid_communicate_group()
+            if hasattr(hcg, "get_context_parallel_rank"):
+                return max(hcg.get_context_parallel_rank(), 0)
+            else:
+                return 0
+        else:
+            return 0
+
     def _format_name(self, prefix, rank, degree):
         size = 2
         return f"{prefix}{rank:0>{size}d}"
@@ -2167,7 +2387,7 @@ class TrainingArguments:
                 name.append(self._format_name("pp", self.pipeline_parallel_rank, self.pipeline_parallel_degree))
             if self.sharding_parallel_degree > 1:
                 name.append(self._format_name("shard", self.sharding_parallel_rank, self.sharding_parallel_degree))
-            if self.use_expert_parallel:
+            if self.use_expert_parallel and self.expert_parallel_degree <= 1:
                 name.append(self._format_name("moe", self.data_parallel_rank, self.data_parallel_degree))
             return "_".join(name)
         else:
@@ -2183,7 +2403,7 @@ class TrainingArguments:
                 name.append(self._format_name("tp", self.tensor_parallel_rank, self.tensor_parallel_degree))
             if self.pipeline_parallel_degree > 1:
                 name.append(self._format_name("pp", self.pipeline_parallel_rank, self.pipeline_parallel_degree))
-            if self.use_expert_parallel:
+            if self.use_expert_parallel and self.expert_parallel_degree <= 1:
                 name.append(self._format_name("moe", self.data_parallel_rank, self.data_parallel_degree))
             return "_".join(name)
 
@@ -2192,7 +2412,9 @@ class TrainingArguments:
                 return self._format_name("moe", self.data_parallel_rank, self.data_parallel_degree)
             return None
 
-    def sharded_name_suffix(self, shard_id=None, pp_id=None, moe_id=None):
+    def sharded_name_suffix(self, shard_id=None, pp_id=None, moe_id=None, sharding_parallel_degree=None):
+        if sharding_parallel_degree is None:
+            sharding_parallel_degree = self.sharding_parallel_degree
         if self.use_hybrid_parallel:
             name = []
             if self.tensor_parallel_degree > 1:
@@ -2202,12 +2424,12 @@ class TrainingArguments:
                     pp_id = self.pipeline_parallel_rank
                 assert isinstance(pp_id, int)
                 name.append(self._format_name("pp", pp_id, self.pipeline_parallel_degree))
-            if self.sharding_parallel_degree > 1:
+            if sharding_parallel_degree > 1:
                 if shard_id is None:
                     shard_id = self.sharding_parallel_rank
                 assert isinstance(shard_id, int)
-                name.append(self._format_name("shard", shard_id, self.sharding_parallel_degree))
-            if self.use_expert_parallel:
+                name.append(self._format_name("shard", shard_id, sharding_parallel_degree))
+            if self.use_expert_parallel and self.expert_parallel_degree <= 1:
                 if moe_id is None:
                     moe_id = self.data_parallel_rank
                 assert isinstance(moe_id, int)
@@ -2308,6 +2530,8 @@ class TrainingArguments:
                 return True
             elif self.enable_auto_parallel:
                 return True
+            elif self.save_checkpoint_format == "flex_checkpoint":
+                return False
             elif self.use_hybrid_parallel:
                 # save on dataset rank 0
                 return self.sharding_parallel_rank == 0 and (self.data_parallel_rank == 0 or self.use_expert_parallel)
@@ -2326,16 +2550,16 @@ class TrainingArguments:
         if self.enable_auto_parallel:
             return False
         return (
-            ShardingOption.SHARD_OP in self.sharding and self.sharding_parallel_degree > 1 and self.save_sharded_model
+            ShardingOption.SHARD_OP in self.sharding
+            and self.sharding_parallel_degree > 1
+            and self.save_checkpoint_format == "sharding_io"
         )
 
     @property
     def should_load_sharding_stage1_model(self):
         if self.enable_auto_parallel:
             return False
-        return (
-            ShardingOption.SHARD_OP in self.sharding and self.sharding_parallel_degree > 1 and self.load_sharded_model
-        )
+        return self.load_checkpoint_format == "sharding_io"
 
     @property
     def should_load_dataset(self):
