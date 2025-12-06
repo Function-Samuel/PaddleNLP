@@ -1486,17 +1486,11 @@ class Qwen2LMHead(nn.Layer):
     def forward(self, hidden_states, tensor_parallel_output=None, batch_size=None):
         # add this for fused_head_and_loss_fn
         if self.config.use_fused_head_and_loss_fn:
-            # return hidden_states, self.weight, None, self.transpose_y
-            return hidden_states, self.weight, None, None
+            return hidden_states, self.weight, None, self.transpose_y
 
         if self.config.sequence_parallel:
             hidden_states = GatherOp.apply(hidden_states)
-            if batch_size is not None:
-                hidden_states = paddle.reshape_(hidden_states, [batch_size, -1, self.config.hidden_size])
-            else:
-                hidden_states = paddle.reshape_(
-                    hidden_states, [-1, self.config.max_sequence_length, self.config.hidden_size]
-                )
+            hidden_states = paddle.reshape_(hidden_states, [batch_size, -1, self.config.hidden_size])
 
         if tensor_parallel_output is None:
             tensor_parallel_output = self.config.tensor_parallel_output

@@ -130,6 +130,7 @@ from ..utils.env import (
     PADDLE_WEIGHTS_INDEX_NAME,
     PADDLE_WEIGHTS_NAME,
     PREFIX_CHECKPOINT_DIR,
+    PREFIX_HF_CHECKPOINT_DIR,
     PREFIX_WEIGHTS_NAME,
     SAFE_MASTER_WEIGHTS_INDEX_NAME,
     SAFE_PEFT_WEIGHTS_INDEX_NAME,
@@ -187,12 +188,17 @@ from .utils.async_save import AsyncSaver
 
 try:
     from .utils.zero_cost_checkpoint import (
+        DistInfoCollectorValidator,
+        NonZCCEMACallback,
         ZeroCostCheckpointCallback,
+        ZeroCostCheckpointCallbackFcBased,
         ZeroCostCheckpointManager,
-        get_fused_param_mappings,
+        ZeroCostCheckpointWorker,
+        ZeroCostCheckpointWorkerFcBased,
     )
 except (ImportError, ModuleNotFoundError):
-    ZeroCostCheckpointManager, get_fused_param_mappings = None, None
+    ZeroCostCheckpointManager, NonZCCEMACallback = None, None
+
 from .utils.helper import (  # nested_truncate,
     broadcast_dataset_rank0_model,
     broadcast_dp_optimizer,
@@ -794,6 +800,90 @@ class Trainer:
             self._load_from_checkpoint(resume_from_checkpoint)
         return model
 
+    def _get_zcc_implementation_classes(self):
+        """Get appropriate ZCC implementation classes based on checkpoint format."""
+        if self.args.save_checkpoint_format == "flex_checkpoint":
+            return ZeroCostCheckpointCallbackFcBased, ZeroCostCheckpointWorkerFcBased
+        return ZeroCostCheckpointCallback, ZeroCostCheckpointWorker
+
+    def _create_zcc_manager_instance(self, unwrapped_model, zcc_worker_class):
+        """Create ZCC manager instance with appropriate configuration."""
+        if isinstance(self.model, PipelineLayer):
+            pipeline_hooks_capacity = (
+                unwrapped_model.forward_pipeline_parallel_hook_capacity
+                + unwrapped_model.backward_pipeline_parallel_hook_capacity
+            )
+        else:
+            pipeline_hooks_capacity = self.args.gradient_accumulation_steps
+
+        return ZeroCostCheckpointManager(
+            worker_num=self.args.zcc_workers_num,
+            pipeline_hooks_capacity=pipeline_hooks_capacity,
+            capacity_usage=self.args.zcc_pipeline_hooks_capacity_usage,
+            use_expert_parallel=self.args.use_expert_parallel,
+            ema_coef=self.args.zcc_save_ema_coef,
+            zcc_worker_class=zcc_worker_class,
+        )
+
+    def _register_pipeline_hooks(self, unwrapped_model):
+        """Register forward and backward pipeline hooks."""
+        # Register forward hooks
+        for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
+            unwrapped_model.register_forward_pipeline_parallel_hook(
+                location=i, hook=self.zcc_manager.zcc_pipeline_hook
+            )
+
+        # Register backward hooks
+        for i in range(unwrapped_model.backward_pipeline_parallel_hook_capacity):
+            unwrapped_model.register_backward_pipeline_parallel_hook(
+                location=i, hook=self.zcc_manager.zcc_pipeline_hook
+            )
+
+    def _setup_zcc_callback(self, zcc_callback_class):
+        """Setup ZCC callback with required dependencies."""
+        callback = zcc_callback_class(self.args, self.zcc_manager, self.runtime_timer, self.sharding_io)
+        self.add_callback(callback)
+
+    def _handle_checkpoint_resume(self, resume_from_checkpoint):
+        """Handle resumption from previous checkpoint if provided."""
+        if resume_from_checkpoint is None:
+            return
+
+        ema_state_path = self._get_ema_state_path(resume_from_checkpoint)
+
+        if not os.path.exists(ema_state_path):
+            logger.info(f"ZCC EMA state dict not found at: {ema_state_path}")
+            return
+
+        # Validate distributed strategy compatibility
+        should_load_ema = self._should_load_ema_state(resume_from_checkpoint, ema_state_path)
+
+        if should_load_ema:
+            logger.info(f"Loading ZCC EMA state from: {ema_state_path}")
+            self.zcc_manager.set_ema_state_dict(ema_state_path)
+
+    def _get_ema_state_path(self, checkpoint_path):
+        """Get the path to EMA state based on checkpoint format."""
+        if self.args.save_checkpoint_format == "flex_checkpoint":
+            return os.path.join(checkpoint_path, "ema_state", f"{dist.get_rank()}_0.distcp")
+        else:
+            optimizer_name = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+            return os.path.join(checkpoint_path, optimizer_name).replace("optimizer", "ema")
+
+    def _should_load_ema_state(self, checkpoint_path, ema_state_path):
+        """Determine if EMA state should be loaded based on configuration and compatibility."""
+        if self.args.zcc_save_ema_coef is None:
+            logger.info("EMA coefficient is None, skipping EMA state loading")
+            return False
+
+        success, err_msg = DistInfoCollectorValidator(self.args, self.hcg).check_same_strategy(checkpoint_path)
+
+        if not success:
+            logger.warning(f"Cannot load EMA state due to strategy mismatch: {err_msg}")
+            return False
+
+        return True
+
     def create_zcc_manager(self, unwrapped_model, resume_from_checkpoint=None):
         """
         Create zero cost checkpoint manager.
@@ -804,55 +894,25 @@ class Trainer:
             self.model, PretrainedModel
         ), "model should be a PretrainedModel when using zero cost checkpoint"
         logger.info("Create zero cost checkpoint manager...")
+
+        zcc_callback_class, zcc_worker_class = self._get_zcc_implementation_classes()
+
+        # Create ZCC manager with appropriate configuration
+        self.zcc_manager = self._create_zcc_manager_instance(unwrapped_model, zcc_worker_class)
+
+        # Register pipeline hooks if using pipeline parallelism
         if isinstance(self.model, PipelineLayer):
-            pipeline_hooks_capacity = (
-                unwrapped_model.forward_pipeline_parallel_hook_capacity
-                + unwrapped_model.backward_pipeline_parallel_hook_capacity
-            )
-            self.zcc_manager = ZeroCostCheckpointManager(
-                worker_num=self.args.zcc_workers_num,
-                pipeline_hooks_capacity=pipeline_hooks_capacity,
-                capacity_usage=self.args.zcc_pipeline_hooks_capacity_usage,
-                use_expert_parallel=self.args.use_expert_parallel,
-                ema_coef=self.args.zcc_save_ema_coef,
-            )
-            for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
-                unwrapped_model.register_forward_pipeline_parallel_hook(
-                    location=i, hook=self.zcc_manager.zcc_pipeline_hook
-                )
-            for i in range(unwrapped_model.backward_pipeline_parallel_hook_capacity):
-                unwrapped_model.register_backward_pipeline_parallel_hook(
-                    location=i, hook=self.zcc_manager.zcc_pipeline_hook
-                )
-        else:
-            pipeline_hooks_capacity = self.args.gradient_accumulation_steps
-            self.zcc_manager = ZeroCostCheckpointManager(
-                worker_num=self.args.zcc_workers_num,
-                pipeline_hooks_capacity=pipeline_hooks_capacity,
-                capacity_usage=self.args.zcc_pipeline_hooks_capacity_usage,
-                use_expert_parallel=self.args.use_expert_parallel,
-                ema_coef=self.args.zcc_save_ema_coef,
-            )
-        _callback = ZeroCostCheckpointCallback(self.args, self.zcc_manager, self.runtime_timer, self.sharding_io)
-        self.add_callback(_callback)
+            self._register_pipeline_hooks(unwrapped_model)
 
-        if resume_from_checkpoint is not None:
-            path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
-            path = os.path.join(resume_from_checkpoint, path).replace("optimizer", "ema")
-            if self.args.zcc_save_ema_coef is not None and self.sharding_io is not None:
-                success, err_msg = self.sharding_io.check_same_strategy(resume_from_checkpoint)
-            else:
-                success, err_msg = True, None
-            if os.path.exists(path):
-                if success:
-                    logger.info(f"ZCC EMA load from {path}")
-                    self.zcc_manager.set_ema_state_dict(path)
-                else:
-                    logger.info(f"ZCC EMA does not load {path} because {err_msg}")
-            else:
-                logger.info(f"ZCC EMA state dict not found, in: {path}")
+        # Add callback and handle checkpoint resumption
+        self._setup_zcc_callback(zcc_callback_class)
 
-        logger.info("Create zero cost checkpoint manager done.")
+        self._handle_checkpoint_resume(resume_from_checkpoint)
+
+        logger.info("Zero cost checkpoint manager created successfully.")
+
+    def add_non_zcc_ema_callback(self, resume_from_checkpoint):
+        self.add_callback(NonZCCEMACallback(resume_from_checkpoint, self.args, self.sharding_io))
 
     def train(
         self,
@@ -1026,6 +1086,8 @@ class Trainer:
 
         if self.args.enable_zero_cost_checkpoint:
             self.create_zcc_manager(model, resume_from_checkpoint)
+        elif self.args.zcc_save_ema_coef is not None:
+            self.add_non_zcc_ema_callback(resume_from_checkpoint)
 
         logger.info(f"{self.runtime_timer.log()}")
         logger.info("***** Running training *****")
@@ -1450,7 +1512,7 @@ class Trainer:
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
 
                     # For ZCC EMA
-                    if self.args.enable_zero_cost_checkpoint:
+                    if self.args.enable_zero_cost_checkpoint or self.args.zcc_save_ema_coef is not None:
                         tr_loss_for_zcc = tr_loss.clone()
                         dist.all_reduce(
                             tr_loss_for_zcc, dist.ReduceOp.SUM
@@ -3053,28 +3115,30 @@ class Trainer:
     def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
         if self.args.save_total_limit is None or self.args.save_total_limit <= 0:
             return
+        for checkpoint_prefix in [PREFIX_CHECKPOINT_DIR, PREFIX_HF_CHECKPOINT_DIR]:
+            # Check if we should delete older checkpoint(s)
+            checkpoints_sorted = self._sorted_checkpoints(
+                use_mtime=use_mtime, checkpoint_prefix=checkpoint_prefix, output_dir=output_dir
+            )
+            if len(checkpoints_sorted) <= self.args.save_total_limit:
+                return
 
-        # Check if we should delete older checkpoint(s)
-        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
-        if len(checkpoints_sorted) <= self.args.save_total_limit:
-            return
+            # If save_total_limit=1 with load_best_model_at_end=True, we could end up deleting the last checkpoint, which
+            # we don't do to allow resuming.
+            save_total_limit = self.args.save_total_limit
+            if (
+                self.state.best_model_checkpoint is not None
+                and self.args.save_total_limit == 1
+                and checkpoints_sorted[-1] != self.state.best_model_checkpoint
+            ):
+                save_total_limit = 2
 
-        # If save_total_limit=1 with load_best_model_at_end=True, we could end up deleting the last checkpoint, which
-        # we don't do to allow resuming.
-        save_total_limit = self.args.save_total_limit
-        if (
-            self.state.best_model_checkpoint is not None
-            and self.args.save_total_limit == 1
-            and checkpoints_sorted[-1] != self.state.best_model_checkpoint
-        ):
-            save_total_limit = 2
-
-        number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
-        checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
-        for checkpoint in checkpoints_to_be_deleted:
-            logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
-            # ignore_errors for shared disks between train nodes.
-            shutil.rmtree(checkpoint, ignore_errors=True)
+            number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
+            checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+            for checkpoint in checkpoints_to_be_deleted:
+                logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
+                # ignore_errors for shared disks between train nodes.
+                shutil.rmtree(checkpoint, ignore_errors=True)
 
     def _save(
         self,

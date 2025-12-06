@@ -1,4 +1,4 @@
-# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dislora import DisLoRAConfig, DisLoRALinear, DisLoRAModel
-from .lokr import LoKrConfig, LoKrModel
-from .lora import LoRAAutoConfig, LoRAAutoModel, LoRAConfig, LoRAModel
-from .prefix import PrefixConfig, PrefixModelForCausalLM
-from .reft import ReFTModel
-from .tare import TAREModel
-from .vera import VeRAConfig, VeRAModel
+import json
+
+import tqdm
+from datasets import load_dataset
+
+dataset = load_dataset("unicamp-dl/mmarco", "chinese")
+print(dataset["train"][1])
+print(len(dataset["train"]))
+
+
+fw = open("./mmarco.jsonl", "w")
+
+i = 0
+for data in tqdm.tqdm(dataset["train"]):
+
+    data = {"query": data["query"], "pos": [data["positive"]], "neg": [data["negative"]]}
+
+    fw.write(json.dumps(data, ensure_ascii=False) + "\n")
+    i += 1
+    # if i > 200000:
+    #     break
+fw.close()
