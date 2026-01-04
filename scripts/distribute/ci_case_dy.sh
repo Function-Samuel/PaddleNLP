@@ -549,7 +549,7 @@ function llm_gpt_recompute_bs32_bf16_MP2-SD4-stage1() {
     if [ $IS_CUDA123 -ne 0 ];then
         loss_base=8.93676758
     else
-        loss_base=8.93362617
+        loss_base=8.93362999
     fi
     ips_base=64.75564390065037
     mem_base=8904

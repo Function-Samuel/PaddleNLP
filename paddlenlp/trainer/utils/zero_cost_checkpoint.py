@@ -14,13 +14,16 @@
 
 import atexit
 import copy
+import functools
 import hashlib
 import json
 import multiprocessing
 import os
 import random
 import time
-from collections import OrderedDict
+from abc import ABC, abstractmethod
+from collections import OrderedDict, defaultdict
+from dataclasses import replace
 from enum import Enum
 
 import numpy as np
@@ -36,10 +39,7 @@ from paddle.distributed.flex_checkpoint.dcp.metadata import (
     LocalTensorMetadata,
     Metadata,
 )
-from paddle.distributed.flex_checkpoint.dcp.save_state_dict import (
-    balanced_dedup_key_in_dict,
-    dedup_key_in_dict,
-)
+from paddle.distributed.flex_checkpoint.dcp.save_state_dict import dedup_key_in_dict
 from paddle.distributed.flex_checkpoint.dcp.sharded_weight import ShardedWeight
 from paddle.distributed.flex_checkpoint.dcp.utils import (
     flatten_state_dict,
@@ -51,9 +51,16 @@ from paddle.incubate.tensor.manipulation import (
 )
 from paddle.optimizer.fusion_utils import FusionStorageHelper
 
+from paddlenlp.trainer.utils.sharding_io import GroupGetter
+
 from ...transformers.model_utils import unwrap_optimizer
 from . import reshard as reshard_util
-from .reshard import SHARDING_STRATEGY_V1
+from .reshard import (
+    SHARDING_STRATEGY_V1,
+    merge_model_state,
+    split_model_state,
+    split_opt_state,
+)
 
 try:
     from paddle.distributed.fleet.meta_optimizers.dygraph_optimizer.dygraph_sharding_optimizer import (
@@ -123,6 +130,65 @@ def showmem(msg):
     )
 
 
+# the funciotn that accept state dict as input can be decorated with this function
+def sharded_state_dict_compatibility(func, *, return_sharded_state_dict=False):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        def should_convert(maybe_sharded_state_dict):
+            all_shared_weights = all(isinstance(value, ShardedWeight) for value in maybe_sharded_state_dict.values())
+            any_shared_weights = any(isinstance(value, ShardedWeight) for value in maybe_sharded_state_dict.values())
+            logger.debug(f"all sharded weight {all_shared_weights}, any shared weight {any_shared_weights}")
+            if not any_shared_weights:
+                logger.debug("this is not a sharded state dict, no need to convert.")
+                return False
+
+            if any_shared_weights and (not all_shared_weights):
+                logger.debug("this is a mixed state dict(normal and sharded), not support to convert.")
+                return False
+            logger.debug("this is a sharded state dict, will convert it to local tensor dict.")
+            return True
+
+        original_sharded_state_dict = {}
+        # process args
+        new_args = list(args)
+        for idx, arg in enumerate(new_args):
+            if not isinstance(arg, dict):
+                continue
+            if should_convert(arg):
+                local_tensor_state_dict = {}
+                for k, v in arg.items():
+                    local_tensor_state_dict[k] = v.local_tensor
+
+                original_sharded_state_dict.update(arg)
+                new_args[idx] = local_tensor_state_dict
+
+        # process kwargs
+        for key, value in kwargs.items():
+            if not isinstance(value, dict):
+                continue
+            if should_convert(value):
+                local_tensor_state_dict = {}
+                for k, v in value.items():
+                    local_tensor_state_dict[k] = v.local_tensor
+
+                kwargs[key] = local_tensor_state_dict
+                original_sharded_state_dict.update(value)
+
+        # original function
+        result = func(*new_args, **kwargs)
+
+        if return_sharded_state_dict:
+            assert isinstance(result, dict), f"expected dict, but got {type(result)}"
+            for k, v in result.items():
+                sharded_sharded_weight = original_sharded_state_dict[k]
+                sharded_sharded_weight.local_tensor = v
+                result[k] = sharded_sharded_weight
+        return result
+
+    return wrapper
+
+
+@sharded_state_dict_compatibility
 def get_fused_param_mappings(optimizer, manipulated_state_dict):
     param_mappings = {}
     ipc_meta_mappings = {}
@@ -1077,28 +1143,21 @@ class ZeroCostCheckpointWorker:
         )
 
 
-class EMABuffer:
-    def __init__(self, resume_from_checkpoint, args, sharding_io, offload=True):
-        assert sharding_io is not None, "EMA should be only enabled when save_sharded_model is True"
+class EMABuffer(ABC):
+    def __init__(self, resume_from_checkpoint, args, offload=True):
         self.master_weights = {}
         self.model_params = {}
         self.args = args
-        self.sharding_io = sharding_io
         self.offload = offload
         if resume_from_checkpoint is not None:
             self._load(resume_from_checkpoint)
-
-    def _ema_path(self, base_path):
-        path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
-        path = path.replace("optimizer", "ema")
-        return os.path.join(base_path, path)
 
     def _load(self, resume_from_checkpoint):
         ema_path = self._ema_path(resume_from_checkpoint)
         if not os.path.exists(ema_path):
             return
 
-        success, err_msg = self.sharding_io.check_same_strategy(resume_from_checkpoint)
+        success, err_msg = self._check_consistent_dist_strategy(resume_from_checkpoint)
         if not success:
             logger.info(f"Cannot load EMA because: {err_msg}")
             return
@@ -1125,14 +1184,11 @@ class EMABuffer:
         if ema_loss_threshold is None or loss < ema_loss_threshold:
             logger.info(f"EMA accumulating for step {global_step} ...")
             self._ema_impl(
-                state_dict=self.sharding_io.optimizer.state_dict()["master_weights"],
+                state_dict=self._get_master_weight(),
                 ema_state_dict=self.master_weights,
             )
             self._ema_impl(
-                state_dict=self.sharding_io.manipulate_state_dict_and_config(
-                    unwrap_model(self.sharding_io.model),
-                    merge_tensor_parallel=False,
-                )[0],
+                state_dict=self._get_model_state(),
                 ema_state_dict=self.model_params,
             )
             logger.info(f"EMA accumulate done for step {global_step}")
@@ -1153,10 +1209,99 @@ class EMABuffer:
                 v = v_pin
             ema_state_dict[k] = v
 
+    @abstractmethod
+    def _get_master_weight(self):
+        pass
+
+    @abstractmethod
+    def _get_model_state(self):
+        pass
+
+    @abstractmethod
+    def _check_consistent_dist_strategy(self, resume_from_checkpoint):
+        pass
+
+
+class EMABufferShardingIOBased(EMABuffer):
+    def __init__(self, resume_from_checkpoint, args, sharding_io, offload=True):
+        assert sharding_io is not None, "EMA should be only enabled when save_sharded_model is True"
+        self.sharding_io = sharding_io
+        super().__init__(resume_from_checkpoint, args, offload)
+
+    def _ema_path(self, base_path):
+        path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+        path = path.replace("optimizer", "ema")
+        return os.path.join(base_path, path)
+
+    def _get_model_state(self):
+        return self.sharding_io.manipulate_state_dict_and_config(
+            unwrap_model(self.sharding_io.model),
+            merge_tensor_parallel=False,
+        )[0]
+
+    def _get_master_weight(self):
+        return self.sharding_io.optimizer.state_dict()["master_weights"]
+
+    def _check_consistent_dist_strategy(self, resume_from_checkpoint):
+        return self.sharding_io.check_same_strategy(resume_from_checkpoint)
+
+
+class EMABufferFcBased(EMABuffer):
+    def __init__(self, resume_from_checkpoint, args, offload=True, hcg=None, model=None, optimizer=None):
+        self.hcg = hcg
+        self.model = model
+        self.optimizer = optimizer
+        self.dist_info_collector_and_validator = DistInfoCollectorValidator(args, hcg)
+
+        self.device_id = int(os.getenv("FLAGS_selected_gpus"))
+        super().__init__(resume_from_checkpoint, args, offload)
+
+    def _get_model_meta(self):
+        return self.dist_info_collector_and_validator.gather_distributed_model_meta(self.model, self.optimizer)
+
+    def _ema_path(self, base_path):
+        return os.path.join(base_path, "ema_state", f"{dist.get_rank()}_0.distcp")
+
+    def _check_consistent_dist_strategy(self, resume_from_checkpoint):
+        return self.dist_info_collector_and_validator.check_same_strategy(resume_from_checkpoint)
+
+    def _get_model_state(self):
+        assert self.model is not None, "expected model is not None"
+        return self.model.state_dict()
+
+    def _get_master_weight(self):
+        assert self.optimizer is not None, "expected optimizer is not None"
+        return self.optimizer.state_dict()["master_weights"]
+
+    def save(self, global_step):
+        model_meta_content = self._get_model_meta()
+        base_path = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
+        os.makedirs(base_path, exist_ok=True)
+        model_meta_path = os.path.join(base_path, MODEL_META_NAME)
+        if self.device_id == 0:
+            with open(model_meta_path, "w") as f:
+                json.dump(model_meta_content, f)
+
+        super().save(global_step)
+
 
 class NonZCCEMACallback(TrainerCallback):
-    def __init__(self, resume_from_checkpoint, args, sharding_io, offload=True):
-        self.buffer = EMABuffer(resume_from_checkpoint, args, sharding_io, offload)
+    def __init__(self, ema_buffer: EMABuffer):
+        self.buffer = ema_buffer
+
+    @staticmethod
+    def create_nonzcc_callback(
+        args, resume_from_checkpoint, sharding_io=None, model=None, optimizer=None, hcg=None, offload=True
+    ):
+        if args.save_checkpoint_format == "flex_checkpoint":
+            ema_buffer = EMABufferFcBased(
+                resume_from_checkpoint, args, offload=offload, hcg=hcg, model=model, optimizer=optimizer
+            )
+        else:
+            assert sharding_io is not None, "EMA should be only enabled when save_sharded_model is True"
+            ema_buffer = EMABufferShardingIOBased(resume_from_checkpoint, args, sharding_io, offload=offload)
+
+        return NonZCCEMACallback(ema_buffer)
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % args.zcc_ema_interval == 0:
@@ -1284,7 +1429,7 @@ class DistInfoCollectorValidator:
         if not self.args.use_hybrid_parallel:
             return None
 
-        if not self.args.should_save_sharding_stage1_model:
+        if not (self.args.should_save_sharding_stage1_model or self.args.save_checkpoint_format == "flex_checkpoint"):
             return None
 
         nranks = dist.get_world_size()
@@ -1313,7 +1458,7 @@ class DistInfoCollectorValidator:
         return True, None
 
 
-def saved_ckptmeta(state_dict, ckpt_file_name, process_group=None):
+def saved_ckptmeta(state_dict, ckpt_file_name, process_group=None, replicate_saved_into_local=False):
     with paddle.base.dygraph.guard():
         assert isinstance(state_dict, dict), "The state_dict should be a dictionary."
         flat_state_dict, mapping = flatten_state_dict(state_dict)
@@ -1349,19 +1494,16 @@ def saved_ckptmeta(state_dict, ckpt_file_name, process_group=None):
             else:
                 flattened_range = None
             local_state_dict_metadata[key] = LocalTensorMetadata(
-                global_offset,
-                local_shape,
+                tuple(global_offset),
+                tuple(local_shape),
                 local_tensor_dtype,
-                global_shape,
+                tuple(global_shape),
                 is_flattened,
                 flattened_range,
             )
             local_storage_metadata[
                 LocalTensorIndex(
-                    key,
-                    tuple(global_offset),
-                    is_flattened,
-                    flattened_range,
+                    key, tuple(global_offset), is_flattened, flattened_range, local_shape=tuple(local_shape)
                 )
             ] = ckpt_file_name
 
@@ -1383,10 +1525,38 @@ def saved_ckptmeta(state_dict, ckpt_file_name, process_group=None):
             global_storage_metadata.append(local_storage_metadata)
             global_flatten_mapping.append(mapping)
 
+        def balanced_dedup_key_in_dict(global_storage_metadata):
+            lti_to_files = defaultdict(set)
+            for storage_metadata in global_storage_metadata:
+                for lti, fname in storage_metadata.items():
+                    lti_to_files[lti].add(fname)
+
+            file_load = defaultdict(int)
+            out = {}
+            for lti, file_candidates in lti_to_files.items():
+                candidates = sorted(file_candidates)
+                selected_main_file = min(candidates, key=lambda f: file_load[f])
+                file_load[selected_main_file] += 1
+
+                if replicate_saved_into_local:
+                    lti_main = replace(lti, replica_id=0)
+                    out[lti_main] = selected_main_file
+                    replica_id = 1
+                    for fname in candidates:
+                        if fname == selected_main_file:
+                            continue
+                        lti_replica = replace(lti, replica_id=replica_id)
+                        out[lti_replica] = fname
+                        replica_id += 1
+                else:
+                    out[lti] = selected_main_file
+
+            return out
+
         metadata.state_dict_metadata = merge_state_dict_metadata(global_state_dict_metadata)
         metadata.storage_metadata = balanced_dedup_key_in_dict(global_storage_metadata)
         metadata.flat_mapping = dedup_key_in_dict(global_flatten_mapping)
-        logger.debug(f"metadata:{metadata}")
+        # logger.debug(f"metadata:{metadata}")
 
         def _gen_filter_map():
             for tensor_index, file_name in metadata.storage_metadata.items():
@@ -1396,7 +1566,7 @@ def saved_ckptmeta(state_dict, ckpt_file_name, process_group=None):
                     local_state_dict_filter_map[tensor_index.tensor_key] = True
 
         _gen_filter_map()
-        logger.debug(f"local_state_dict_filter_map:{local_state_dict_filter_map}")
+        # logger.debug(f"local_state_dict_filter_map:{local_state_dict_filter_map}")
 
         return metadata, local_state_dict_filter_map
 
@@ -1415,54 +1585,47 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
             self.sharding_group = self.hcg.get_sharding_parallel_group()
 
     def _manipulate_state_dict_and_config(self, model_to_save, optimizer):
-        # TODO(): at now accracy is wrong, need to fix later.
-        return model_to_save.sharded_state_dict()
-        # group_getter = GroupGetter(model_to_save)
-        # gids = group_getter.get_group_ids()
-        # from paddleformers.trainer.utils.sharding_io import filter_sharded_params, exclude_parameters_in_state_dict
+        group_getter = GroupGetter(model_to_save)
+        gids = group_getter.get_group_ids()
+        from paddlenlp.trainer.utils.sharding_io import exclude_parameters_in_state_dict
 
-        # filter_sharded_params = sharded_state_dict_compatibility(filter_sharded_params, return_sharded_state_dict=True)
-        # exclude_parameters_in_state_dict = sharded_state_dict_compatibility(exclude_parameters_in_state_dict, return_sharded_state_dict=True)
+        state_dict = model_to_save.state_dict()
 
-        # state_dict = model_to_save.sharded_state_dict()
-        # if self.args.should_save_sharding_stage1_model:
-        #     state_dict = split_model_state(state_dict, group_getter)
-        #     for gid in gids:
-        #         state_dict[gid] = filter_sharded_params(
-        #             state_dict.get(gid, {}),
-        #             optimizer,
-        #             self.sharding_group,
-        #             self.args.save_sharding_stage1_model_include_freeze_params,
-        #         )
-        #     state_dict = merge_model_state(state_dict)
+        if self.args.bf16:
+            param_names_in_master_weights = []
+            optimzier_state_dict = optimizer.state_dict()
+            optimzier_state_dict = split_opt_state(optimzier_state_dict, group_getter)
+            state_dict = split_model_state(state_dict, group_getter)
+            for gid in gids:
+                sub_opt_state = optimzier_state_dict.get(gid, {})
+                param_names_in_master_weights = list(sub_opt_state.get("master_weights", {}).keys())
+                state_dict[gid] = exclude_parameters_in_state_dict(
+                    state_dict.get(gid, {}),
+                    param_names_in_master_weights,
+                    group_getter.get_group_by_id(gid),
+                )
+            state_dict = merge_model_state(state_dict)
+            logger.info(
+                "param_names_in_master_weights len:{}, bf16 state_dict len:{}, :{}".format(
+                    len(param_names_in_master_weights), len(state_dict), state_dict.keys()
+                )
+            )
 
-        # if self.args.bf16 and self.args.should_save_sharding_stage1_model:
-        #     param_names_in_master_weights = []
-        #     optimzier_state_dict = optimizer.state_dict()
-        #     optimzier_state_dict = split_opt_state(optimzier_state_dict, group_getter)
-        #     state_dict = split_model_state(state_dict, group_getter)
-        #     for gid in gids:
-        #         sub_opt_state = optimzier_state_dict.get(gid, {})
-        #         param_names_in_master_weights = list(sub_opt_state.get("master_weights", {}).keys())
-        #         state_dict[gid] = exclude_parameters_in_state_dict(
-        #             state_dict.get(gid, {}),
-        #             param_names_in_master_weights,
-        #             group_getter.get_group_by_id(gid),
-        #         )
-        #     state_dict = merge_model_state(state_dict)
-        #     logger.info(
-        #         "param_names_in_master_weights len:{}, bf16 state_dict len:{}, :{}".format(
-        #             len(param_names_in_master_weights), len(state_dict), state_dict.keys()
-        #         )
-        #     )
-
-        # return state_dict
+        return state_dict
 
     def _cache_meta_for_sharded_save(self, model, optimizer):
         logger.info("Start caching metas for sharded save...")
         (self.manipulated_state_dict) = self._manipulate_state_dict_and_config(model, optimizer)
 
-        logger.debug(f"manipulated_state_dict: {self.manipulated_state_dict.keys()}")
+        def recover_sharded_state_dict():
+            filtered_sharded_state_dict = {}
+            model_sharded_state_dict = model.sharded_state_dict()
+            for k, v in self.manipulated_state_dict.items():
+                filtered_sharded_state_dict[k] = model_sharded_state_dict[k]
+            return filtered_sharded_state_dict
+
+        self.manipulated_state_dict = recover_sharded_state_dict()
+
         logger.info("Cache manipulated static dict done.")
 
         model_to_save = unwrap_model(model)
@@ -1486,7 +1649,9 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
         self.ckpt_data_name, self.ckpt_meta_name = create_ckpt_file_name()
         # self.model_ckpt_meta, self.model_state_filter = saved_ckptmeta(model.sharded_state_dict(), self.ckpt_data_name)
         self.model_ckpt_meta, self.model_state_filter = saved_ckptmeta(
-            self.manipulated_state_dict, self.ckpt_data_name
+            self.manipulated_state_dict,
+            self.ckpt_data_name,
+            replicate_saved_into_local=self.args.replicate_saved_into_local,
         )
 
         # opt state dict ckpt meta and filter
@@ -1500,14 +1665,44 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
             else:
                 opt_state_dict[k] = v
 
-        self.opt_ckpt_meta, self.opt_state_filter = saved_ckptmeta(opt_state_dict, self.ckpt_data_name)
-        self.master_weight_ckpt_meta, self.master_weights_filter = saved_ckptmeta(master_weights, self.ckpt_data_name)
+        self.opt_ckpt_meta, self.opt_state_filter = saved_ckptmeta(
+            opt_state_dict, self.ckpt_data_name, replicate_saved_into_local=self.args.replicate_saved_into_local
+        )
+        self.master_weight_ckpt_meta, self.master_weights_filter = saved_ckptmeta(
+            master_weights, self.ckpt_data_name, replicate_saved_into_local=self.args.replicate_saved_into_local
+        )
 
         # gen unified name mapping for optimzier
-        self.unified_name_mapping = self._gen_unified_name(optimizer, model.sharded_state_dict())
+        self.unified_name_mapping, self.param_slice_info = self._gen_unified_name(
+            optimizer, model.sharded_state_dict()
+        )
         logger.info("Cache distributed model meta done.")
 
     def _gen_unified_name(self, optimizer, model_sharded_state_dict):
+        param_slice_info = {}
+        padded_param = set()
+        for buffer in optimizer._comm_buffer_list:
+            for (
+                param_name,
+                grad_view,
+            ) in buffer._sharding_param_grad_view.items():
+                numel = grad_view._param.numel().item()
+                param_begin = grad_view._param_begin
+                param_end = grad_view._param_end
+                index = grad_view._index
+                padding_begin = index + numel
+                flattened_range = slice(
+                    param_begin - index,
+                    max(
+                        min(padding_begin - index, param_end - index),
+                        param_begin - index,
+                    ),
+                )
+                if param_end > padding_begin:
+                    padded_param.add(param_name)
+
+                param_slice_info[param_name] = flattened_range
+
         _FP32_MASTER = "fp32_master_0"
         _optimizer_scalar_name = [
             "beta1_pow_acc_0",
@@ -1527,6 +1722,7 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
                     return vname[: -(len(name) + 1)], name
             raise ValueError(f"Cannot split variable name: {vname}.")
 
+        model_sharded_state_dict = dict(sorted(model_sharded_state_dict.items()))
         static_to_struct_mapping = {}
         for k, v in model_sharded_state_dict.items():
             if v.local_tensor.name not in static_to_struct_mapping:
@@ -1534,6 +1730,7 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
 
         optimizer_state_dict = optimizer.state_dict()
         optimizer_unified_name_mapping = {}
+        unified_slice_info = {}
 
         master_weights = optimizer_state_dict.pop("master_weights", None)
         optimizer_state_dict.pop("LR_Scheduler", None)
@@ -1541,15 +1738,28 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
             static_name, optim_state_type = _generate_base_static_name(key)
             struct_name = static_to_struct_mapping[static_name]
             unified_name = f"{struct_name}.{optim_state_type}"
+
+            flattened_range = param_slice_info[static_name]
+
+            # if flattened_range.stop - flattened_range.start == 0:
+            #     continue
             optimizer_unified_name_mapping[key] = unified_name
+            unified_slice_info[unified_name] = flattened_range
 
         if master_weights is not None:
             for key, _ in master_weights.items():
                 struct_name = static_to_struct_mapping[key]
                 unified_name = f"{struct_name}.w_0"
-                optimizer_unified_name_mapping[key] = unified_name
 
-        return optimizer_unified_name_mapping
+                flattened_range = param_slice_info[key]
+
+                # if flattened_range.stop - flattened_range.start == 0:
+                #     continue
+
+                optimizer_unified_name_mapping[key] = unified_name
+                unified_slice_info[unified_name] = flattened_range
+
+        return optimizer_unified_name_mapping, unified_slice_info
 
     def _pack_dynamic_objects(self):
         dynamic_objecs = {}
@@ -1568,6 +1778,7 @@ class ZeroCostCheckpointCallbackFcBased(ZeroCostCheckpointCallback):
         dynamic_objecs["master_weights_filter"] = self.master_weights_filter
 
         dynamic_objecs["unified_name_mapping"] = self.unified_name_mapping
+        dynamic_objecs["param_slice_info"] = self.param_slice_info
 
         return dynamic_objecs
 
@@ -1609,6 +1820,7 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
         self.master_weights_filter = dynamic_objecs["master_weights_filter"]
 
         self.unified_name_mapping = dynamic_objecs["unified_name_mapping"]
+        self.param_slice_info = dynamic_objecs["param_slice_info"]
 
         optimizer_states_meta = dynamic_objecs["optimizer_states_meta"]
         model_states_meta = dynamic_objecs["model_states_meta"]
@@ -1635,11 +1847,33 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
     def _filter_state_dict(state_dict, filter_map):
         need_remove_keys = []
         for k, _ in state_dict.items():
-            if filter_map[k]:
+            # two case:
+            # 1. Mutliple key share the same tensor.
+            # 2. Don't need to be saved in current rank.
+            if k not in filter_map.keys():
+                logger.debug(f"[ZCC worker] {k} not exist in filter map.")
+            if (k not in filter_map.keys()) or filter_map[k]:
                 need_remove_keys.append(k)
         for k in need_remove_keys:
             state_dict.pop(k)
         return state_dict
+
+    @staticmethod
+    def _slice_padded_tensor(static_dict, param_slice_info):
+        new_static_dict = {}
+        for k, v in static_dict.items():
+            if k in param_slice_info:
+                logger.info(f"[ZCC worker] Slice padded tensor of {k}")
+                flattened_range = param_slice_info[k]
+                new_static_dict[k] = paddle.slice(
+                    v,
+                    axes=[0],
+                    starts=[0],
+                    ends=[flattened_range.stop - flattened_range.start],
+                )
+            else:
+                new_static_dict[k] = v
+        return new_static_dict
 
     def _save_model_state(self, output_dir):
         data_file_name, meta_file_name = self.distcp_file_name
@@ -1649,9 +1883,10 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
         if self.dp_rank <= 0 or self.use_expert_parallel:
             with device_guard("cpu"):
                 state_dict = self.param_fusion_storage_helper.state_dict()
+                logger.debug(f"model states key before filter is {state_dict.keys()}")
 
                 state_dict = self._filter_state_dict(state_dict, self.model_state_filter)
-
+                logger.debug(f"model states length is {len(state_dict)}")
                 paddle.save(state_dict, self.model_states_path)
 
                 if self.device_id == 0:
@@ -1677,12 +1912,21 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                 master_weights = self._replace_pname_with_unified(master_weights)
                 logger.info("[ZCC worker] master weightsdict replace pname using unified name.")
 
+                opt_state_dict = self._slice_padded_tensor(opt_state_dict, self.param_slice_info)
+                logger.info("[ZCC worker] opt state dict slice padded tensor complete.")
+                master_weights = self._slice_padded_tensor(master_weights, self.param_slice_info)
+                logger.info("[ZCC worker] master weights slice padded tensor complete.")
+
             if self.dp_rank > 0:  # ep
                 opt_state_dict = self._filter_moe_no_sync_optimizer_params(self.model_meta_content, opt_state_dict)
 
             opt_state_dict = self._filter_state_dict(opt_state_dict, self.opt_state_filter)
+            logger.info("[ZCC worker] opt state dict filter by opt_state_filter complete.")
             master_weights = self._filter_state_dict(master_weights, self.master_weights_filter)
+            logger.info("[ZCC worker] master weights dict filter by master_weights_filter complete.")
 
+            logger.debug(f"opt states length is {len(opt_state_dict)}")
+            logger.debug(f"master weights length is {len(master_weights)}")
             paddle.save(opt_state_dict, self.opt_state_path)
             paddle.save(master_weights, self.master_weight_path)
             if self.device_id == 0:
@@ -1698,6 +1942,7 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
 
             if self.dp_rank > 0:
                 ema_state_dict = self._filter_moe_no_sync_optimizer_params(self.model_meta_content, ema_state_dict)
+            logger.debug(f"ema states length is {len(ema_state_dict)}")
             paddle.save(ema_state_dict, self.ema_name_path)
         logger.info("[ZCC worker] Finish ema states saved.")
 
